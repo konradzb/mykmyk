@@ -39,15 +39,17 @@ func (f *Filesystem) Run(ctx context.Context, in interface{}, db *sql.DB) error 
 	case "scope":
 		scope, err := loadScope(task.Input)
 		if err != nil {
-			return errors.Errorf("unable to load scope", err)
+			// Wrap, don't Errorf: loadScope reports unreadable files and overlapping segments,
+			// and Errorf with no verb would drop that detail on the floor.
+			return errors.Wrap(err, "unable to load scope")
 		}
 		for _, s := range scope {
-			m := model.Message{Targets: []string{s}}
+			m := model.Message{Targets: []string{s.Spec}, Interface: s.Interface}
 			f.sns.SendMessage(f.Name, m)
 		}
 		f.sns.CloseTopic(f.Name)
 	default:
-		return errors.Errorf("unsupported filesystem task", err)
+		return errors.Errorf("unsupported filesystem task %q", f.Name)
 	}
 	f.signalDoneTask()
 

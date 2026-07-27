@@ -66,7 +66,7 @@ func Scan(ctx context.Context, cfg api.Config) error {
 	defer db.Close()
 
 	createTopics(tasks, &sns)
-	err = addConsumersToTopics(tasks, &sns)
+	err = addConsumersToTopics(tasks, tasksRunMap, &sns)
 	if err != nil {
 		return err
 	}
@@ -171,7 +171,14 @@ func firstNmapTaskName(tasks []api.Task) string {
 	return ""
 }
 
-func addConsumersToTopics(tasks []abstract.Executor, sns *sns.SNS) error {
+// defaultQueueSize is how many messages a task can have waiting for it before its producer
+// blocks. It is deliberately far larger than any realistic concurrency: SendMessage blocks until
+// every consumer accepts, and a consumer stops reading while its worker pool is saturated, so a
+// queue sized to concurrency lets one slow task (ffuf and nuclei run for minutes per target) stall
+// port discovery for every host still waiting. Override per task with queueSize.
+const defaultQueueSize = 256
+
+func addConsumersToTopics(tasks []abstract.Executor, taskConfig map[string]api.Task, sns *sns.SNS) error {
 	for i := range tasks {
 		if tasks[i].HasSource() && tasks[i].IsActive() {
 			if !isSourceExist(tasks[i].GetSource(), tasks) {
@@ -180,11 +187,11 @@ func addConsumersToTopics(tasks []abstract.Executor, sns *sns.SNS) error {
 			if !isSourceOfTaskIsActive(tasks[i], tasks) {
 				return errors.Errorf("The task %s has a inactive source %s", tasks[i].GetName(), tasks[i].GetSource())
 			}
-			concurrency := tasks[i].GetConcurrency()
-			if concurrency == 0 {
-				concurrency = 1
+			queueSize := taskConfig[tasks[i].GetName()].QueueSize
+			if queueSize < defaultQueueSize {
+				queueSize = defaultQueueSize
 			}
-			consumer := make(chan model.Message, concurrency)
+			consumer := make(chan model.Message, queueSize)
 			sns.AddConsumer(tasks[i].GetSource(), tasks[i].GetName(), consumer)
 			tasks[i].SetConsumer(consumer)
 		}

@@ -3,7 +3,6 @@ package nmap
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -39,6 +38,7 @@ type Nmap struct {
 
 type scanResult struct {
 	target string
+	iface  string
 	result *nmapWrapper.Run
 	err    error
 }
@@ -53,7 +53,7 @@ func (n *Nmap) scanTarget(target string, msg model.Message, db *sql.DB) (*nmapWr
 	if err != nil {
 		return nil, err
 	}
-	result, warnings, err := scan(target, msg.Ports, n.args, n.Name)
+	result, warnings, err := scan(target, msg.Ports, n.args, n.Name, msg.Interface)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +101,7 @@ func (n *Nmap) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 							return
 						default:
 							result, err := n.scanTarget(target, msg, db)
-							resultCh <- scanResult{target: target, result: result, err: err}
+							resultCh <- scanResult{target: target, iface: msg.Interface, result: result, err: err}
 							return
 						}
 					}
@@ -112,18 +112,45 @@ func (n *Nmap) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 	}()
 
 	for r := range resultCh {
-		if r.err != nil && !errors.Is(err, ErrEmptyNmapScanResult) {
-			n.sns.CloseTopic(n.Name)
-			n.signalDoneTask()
-			return err
+		if r.err != nil {
+			// One target failing must not end the task: draining the rest of resultCh is what
+			// keeps the remaining hosts flowing downstream. This matters most behind a discovery
+			// sweep, where the host has been *proven* to exist - dropping it silently would turn
+			// a broken scan into an apparent clean bill of health.
+			log.Printf("nmap: %s scan of %s failed: %s", n.Name, r.target, r.err)
+			n.collectFailure(r.target, r.err)
+			continue
+		}
+		if r.result == nil {
+			continue
 		}
 		liveOutput(n.Name, r.target, r.result)
-		n.sendMessageToSNS(r.result, r.target)
+		if err := n.sendMessageToSNS(r.result, r.target, r.iface); err != nil {
+			// Nothing usable found for this target - normal for a sweep over a sparse segment.
+			log.Printf("nmap: %s found no live host for %s: %s", n.Name, r.target, err)
+		}
 		n.collectOutput(r.target, r.result)
 	}
 	n.sns.CloseTopic(n.Name)
 	n.signalDoneTask()
 	return nil
+}
+
+// collectFailure records a target whose scan errored, so the report names it explicitly. An
+// absent host must never read as a host with nothing open.
+func (n *Nmap) collectFailure(target string, scanErr error) {
+	result := model.Output{
+		Type:   n.Type,
+		Name:   n.Name + " (FAILED - not scanned reliably)",
+		Target: target,
+		Results: model.Results{Data: []string{
+			fmt.Sprintf("\tscan failed: %s\n", scanErr),
+			"\tthis target's absence below is a gap in the scan, not an absence of open ports\n",
+		}},
+	}
+	n.mu.Lock()
+	n.output = append(n.output, result)
+	n.mu.Unlock()
 }
 
 func liveOutput(taskName string, target string, result *nmapWrapper.Run) {
@@ -149,43 +176,91 @@ func (n *Nmap) GetConcurrency() int {
 	return n.Concurrency
 }
 
-func (n *Nmap) sendMessageToSNS(scanResult *nmapWrapper.Run, host string) error {
-	nmapMsg, err := convertToNmapMessage(scanResult, host)
+func (n *Nmap) sendMessageToSNS(scanResult *nmapWrapper.Run, host string, iface string) error {
+	messages, err := convertToNmapMessage(scanResult, host, iface)
 	if err != nil {
 		return err
 	}
-	n.sns.SendMessage(n.Name, nmapMsg)
+	for _, msg := range messages {
+		n.sns.SendMessage(n.Name, msg)
+	}
 
 	return nil
 }
 
-func convertToNmapMessage(result *nmapWrapper.Run, target string) (model.Message, error) {
+// convertToNmapMessage turns one scan result into one message per live host it found.
+//
+// A scan of a single IP yields a single message, as it always has. A host-discovery sweep of a
+// whole segment (nmap -sn -PR 10.113.9.0/24) yields one message per host that answered, which is
+// what lets an ARP sweep gate the expensive port scans behind it: only addresses proven to exist
+// are ever handed downstream.
+func convertToNmapMessage(result *nmapWrapper.Run, target string, iface string) ([]model.Message, error) {
 	if result.Hosts == nil {
-		return model.Message{}, ErrEmptyNmapScanResult
+		return nil, ErrEmptyNmapScanResult
 	}
-	ports := make([]string, 0)
+	messages := make([]model.Message, 0, len(result.Hosts))
 	for _, host := range result.Hosts {
+		if !isHostUsable(host) {
+			continue
+		}
+		ports := make([]string, 0, len(host.Ports))
 		for _, p := range host.Ports {
 			ports = append(ports, strconv.Itoa(int(p.ID)))
 		}
+		messages = append(messages, model.Message{
+			Targets:   []string{hostAddress(host, target)},
+			Ports:     ports,
+			Interface: iface,
+		})
 	}
-	return model.Message{Targets: []string{target}, Ports: ports}, nil
+	if len(messages) == 0 {
+		return nil, ErrEmptyNmapScanResult
+	}
+	return messages, nil
+}
+
+// isHostUsable reports whether a host in a scan result is worth scanning further. Under -vvv nmap
+// records the hosts it found *down* as well, so a sweep's result has to be filtered by status or
+// every dead address in the range gets forwarded as a live target.
+func isHostUsable(host nmapWrapper.Host) bool {
+	if host.Status.State != "up" {
+		return false
+	}
+	// Our own interface address answers a sweep with reason "localhost-response" (real hosts on
+	// the segment answer "arp-response"). Port-scanning ourselves is never the intent and costs a
+	// full host timeout.
+	return host.Status.Reason != "localhost-response"
+}
+
+// hostAddress returns a host's own IPv4 address, falling back to the scanned target when the
+// result carries no address. The fallback keeps a single-target scan working even if nmap omits
+// the address element.
+func hostAddress(host nmapWrapper.Host, target string) string {
+	for _, addr := range host.Addresses {
+		if addr.AddrType == "ipv4" {
+			return addr.Addr
+		}
+	}
+	return target
 }
 
 func convertNmapResultToString(result *nmapWrapper.Run, target string) []string {
-	// if result.Hosts == nil {
-	// 	return "", ErrEmptyNmapScanResult //errors.New("no hosts in nmap result")
-	// }
-	//output := bytes.Buffer{}
 	output := make([]string, 0)
 	for _, host := range result.Hosts {
+		if len(host.Ports) == 0 {
+			// A host-discovery sweep (-sn) finds hosts but no ports. Report liveness instead, so
+			// a discovery task shows what it found rather than rendering an empty block.
+			if isHostUsable(host) {
+				output = append(output, fmt.Sprintf("\t%-18s %s\n", hostAddress(host, target), "host up"))
+			}
+			continue
+		}
 		for _, p := range host.Ports {
 			o := fmt.Sprintf("\t%-10s %-18s %-18s\n", strconv.Itoa(int(p.ID)), p.Service.Name, p.Service.Product)
-			//output.Write([]byte(o))
 			output = append(output, o)
 		}
 	}
-	return output //output.String()
+	return output
 }
 
 func (n *Nmap) New(task api.Task, sns *sns.SNS, creds credsmanager.Credentials) abstract.Executor {

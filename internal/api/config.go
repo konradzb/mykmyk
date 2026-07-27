@@ -19,6 +19,7 @@ type (
 		Source      string      `yaml:"source,omitempty"`
 		Port        int         `yaml:"port,omitempty"`
 		Concurrency int         `yaml:"concurrency,omitempty"`
+		QueueSize   int         `yaml:"queueSize,omitempty"`
 		WaitFor     string      `yaml:"waitFor,omitempty"`
 		Run         interface{} `yaml:"run,omitempty"`
 		Prefix      string      `yaml:"prefix,omitempty"`

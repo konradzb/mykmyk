@@ -6,6 +6,9 @@
 *.dylib
 cmd/cli/mykmyk
 
+# Runtime log written wherever mykmyk is invoked
+mykmyk.log
+
 # Test binary, built with `go test -c`
 *.test
 
