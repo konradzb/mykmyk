@@ -30,10 +30,59 @@ pentest.co.uk
 20.77.132.140
 google.com
 ```
+Lines beginning with `#` are comments. Each target may carry an optional second column naming the
+network interface that reaches it — used for ARP discovery through a trunk port, where each VLAN
+sits behind its own sub-interface:
+```
+10.113.9.0/24    eth0.100
+10.113.10.0/24   eth0.200
+192.168.50.0/24  eth0.300
+
+pentest.co.uk                # no interface -> kernel routing, as before
+```
+The interface column is optional; a one-column hosts file behaves exactly as it always has. Two
+segments that cover overlapping address space are rejected at start-up, because results are stored
+per target IP and would otherwise collide — scan those in separate runs.
+
 ### 3.	Initialize mykmyk
 this command creates config.yml. The config contains the configuration for each tool like nmap, ffuf, etc. This command creates a local config (in the current directory) and global under your home directory .config/mykmyk. Mykmyk will try to read the local config at first, if doesn't find then try to read the global one:
 ```
 mykmyk init
+```
+
+Configs ship as **templates** (one file per occasion, under `cmd/cli/cmd/configs/`). Running
+`mykmyk init` in a terminal asks which one you want:
+```
+$ mykmyk init
+Available config templates:
+
+  1) default  External/routed scan. TCP connect, no host discovery. No root needed.
+  2) ARP      Internal L2. ARP-gated discovery, trunk/VLAN aware. Fast, requires root.
+
+Choose a template [1-2] (default: 1): 2
+Wrote the "ARP" template to ./config.yml
+```
+The chosen template is always written as `config.yml`, so `mykmyk scan` needs no extra flags. If a
+`config.yml` already exists you are asked before it is replaced (`--force` skips that).
+
+For scripts, pick the template up front — this never prompts:
+```
+mykmyk init --list           # show available templates
+mykmyk init --profile ARP    # write a specific template
+mykmyk init --profile default
+```
+With no terminal attached (a pipe, or CI) `mykmyk init` writes the default template rather than
+waiting for an answer, so existing setup scripts keep working unchanged.
+The **ARP** profile adds an `arp-discovery` task (`nmap -sn -PR` per segment) ahead of the port
+scan, so dead addresses in a range are never port-scanned — a large speed-up on internal `/24`s.
+It uses a raw SYN scan (`-sS --send-ip`), so it must run as root; ARP discovery only reaches hosts
+on a directly attached L2 segment.
+
+To add a template for a new situation, drop a `config-<name>.yaml` file into
+`cmd/cli/cmd/configs/` — it appears in the picker automatically. Give it a summary line so the
+picker has something to show:
+```yaml
+# description: Routed internal segments. Ping sweep instead of ARP.
 ```
 ### 4.	Run scan (run it in screen or tmux). 
 Mykmyk asks for the username, domain name and credentials - which are used for **smb** and **rdp** scan:
@@ -62,10 +111,27 @@ If you want to run for example ffuf scan once again but with a different wordlis
 2.	edit already created ffuf task by changing wordlist and setting useCache to false
 
 # How to build
-Run make from mykmyk/cmd/cli:
-```
-make build
-```
+mykmyk needs CGO (SQLite status DB, RDP), so building for a machine other than the one you are on
+needs a C cross-compiler for the target. Run make from `mykmyk/cmd/cli`:
+
+- **On the Linux scan box** — static Linux binary using the host's gcc:
+  ```
+  make build
+  ```
+- **Cross-compile from macOS (or elsewhere) for a linux/amd64 box** — static, portable across
+  distros. Install the cross-compiler once, then build:
+  ```
+  brew install FiloSottile/musl-cross/musl-cross
+  make build-linux
+  ```
+  Check the result with `file mykmyk`; it should say `ELF 64-bit ... x86-64 ... statically linked`.
+- **Native binary for local testing** on the machine you are on (not deployable to the scan box):
+  ```
+  make build-native
+  ```
+
+The compiled binary only contains mykmyk itself — the external tools it drives (`nmap`, `httpx`,
+`ffuf`, `sslscan`) must be installed on the box where you run the scan.
 
 # Configuration Documentation
 ## General Configuration

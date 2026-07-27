@@ -1,3 +1,15 @@
+# description: Internal L2. ARP-gated discovery, trunk/VLAN aware. Fast, requires root.
+#
+# Internal L2 profile: ARP-gated discovery, trunk/VLAN aware.
+#
+# Requires root (both -PR and -sS do). ARP cannot cross a router, so every segment listed in
+# ./hosts must be on a directly attached broadcast domain. For routed segments, swap the
+# arp-discovery args for a ping sweep: ["-sn","-PE","-PS443","-PA80","-PU40125","-vvv","-oA"]
+#
+# hosts file format - the second column is optional and names the interface reaching that segment:
+#   10.113.9.0/24    eth0.100
+#   10.113.10.0/24   eth0.200
+#   192.168.50.0/24  eth0.300
 outputFile: ./mykmyk-output.html
 workflow:
   tasks:
@@ -7,52 +19,70 @@ workflow:
       useCache: true
       run:
         input: ./hosts
-    - name: ST-scan
+
+    # ARP sweep per segment -> emits one message per LIVE host, carrying its interface.
+    # This is the whole point of the profile: dead addresses are never port-scanned.
+    - name: arp-discovery
       type: nmap
+      source: scope
       active: true
       useCache: true
-      source: scope
-      concurrency: 3
+      concurrency: 8            # segments (VLANs) swept in parallel
       run:
         args:
-          - "-sT"
+          - "-sn"
+          - "-PR"
+          - "-vvv"
+          - "-oA"
+
+    # Full TCP port scan, live hosts only.
+    # --send-ip is required, not cosmetic: -Pn alone does NOT stop nmap ARPing on a local segment
+    # (it still needs each target's MAC to build a frame) and would drop hosts the sweep just
+    # proved up. --send-ip sends at raw IP level so the kernel answers from the ARP cache.
+    - name: ST-scan
+      type: nmap
+      source: arp-discovery
+      active: true
+      useCache: true
+      concurrency: 16
+      run:
+        args:
+          - "-sS"
           - "-vvv"
           - "-Pn"
+          - "--send-ip"
           - "--open"
-          - "--max-rate"
-          - "1000"
+          - "--min-rate"
+          - "2000"
           - "-p-"
           - "-oA"
-        outputs:
-          - name: name
-            jsonPath: '$[*].id'
+
+    # -sV against ONLY the ports ST-scan found open. The port list arrives on the message, so
+    # there must be no -p flag here or nmap would be given two and rescan all 65535.
     - name: SV-scan
       type: nmap
       source: ST-scan
       active: true
       useCache: true
-      concurrency: 4
+      concurrency: 8
       run:
         args:
           - "-sV"
           - "-sC"
           - "-vvv"
           - "-Pn"
+          - "--send-ip"
           - "-A"
-          - "--max-rate"
-          - "1000"
           - "--version-all"
           - "--open"
           - "-oA"
-        outputs:
-          - name: name
-            jsonPath: '$[*].id'
+
     - name: RMI-scan
       type: nmap
       source: ST-scan
       active: true
       useCache: true
-      concurrency: 3
+      concurrency: 8
       run:
         args:
           - "-sT"
@@ -63,29 +93,27 @@ workflow:
           - "--max-rate"
           - "1000"
           - "-oA"
-        outputs:
-          - name: name
-            jsonPath: '$[*].id'
+
     - name: httpx-scan
       type: httpx
       source: ST-scan
-      concurrency: 3
       active: true
       useCache: true
+      concurrency: 5
       run:
         args:
           - "-td"
           - "-vhost"
-        outputs:
-          - name: name
-            jsonPath: '$[*].id'
+
+    # nuclei and ffuf are the slow consumers - minutes per target. The oversized queues keep them
+    # from back-pressuring port discovery through the SNS fan-out.
     - name: nuclei-scan
       type: nuclei
       source: httpx-scan
       active: true
       useCache: true
       concurrency: 3
-      #waitFor: httpx-scan
+      queueSize: 1024
       run:
         args:
           - "-etags"
@@ -99,16 +127,14 @@ workflow:
           - "-ni"
           - "-duc"
           - "-nc"
-        outputs:
-          - name: name
-            jsonPath: '$[*].id'
+
     - name: ffuf-scan
       type: ffuf
       source: httpx-scan
       active: true
       useCache: true
       concurrency: 3
-      #waitFor: httpx-scan
+      queueSize: 1024
       run:
         args:
           - "-w"
@@ -117,67 +143,53 @@ workflow:
           - "-rate"
           - "300"
           - "-v"
-        outputs:
-          - name: name
-            jsonPath: '$[*].id'
+
     - name: ssl-scan
       type: sslscan
       source: httpx-scan
       active: true
       useCache: true
-      concurrency: 3
-      #waitFor: httpx-scan
+      concurrency: 5
       run:
         args:
           - "--no-colour"
           - "--iana-names"
+
     - name: ssl-scan-psql
       type: sslscan
       source: ST-scan
       port: 5432
       active: true
       useCache: true
-      concurrency: 3
-      #waitFor: httpx-scan
+      concurrency: 5
       run:
         args:
           - "--no-colour"
           - "--iana-names"
           - "--starttls-psql"
+
     - name: nc-fingerprint
       type: nc
       source: ST-scan
       active: true
       useCache: true
-      concurrency: 5
-      #waitFor: httpx-scan
+      concurrency: 8
       run:
         args:
           - "<>()&;id"
           - "aa()"
-        outputs:
-          - name: name
-            jsonPath: '$[*].id'
+
     - name: smb-check
       type: smb
       source: ST-scan
       active: true
       useCache: true
-      concurrency: 3
-      #waitFor: httpx-scan
-      run:
-        outputs:
-          - name: name
-            jsonPath: '$[*].id'
+      concurrency: 5
+
     - name: rdp-check
       type: rdp
       source: ST-scan
+      port: 3389
       active: true
       useCache: true
-      port: 3389
-      concurrency: 3
-      #waitFor: httpx-scan
-      run:
-        outputs:
-          - name: name
-            jsonPath: '$[*].id'
+      concurrency: 5
