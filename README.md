@@ -44,6 +44,24 @@ The interface column is optional; a one-column hosts file behaves exactly as it 
 segments that cover overlapping address space are rejected at start-up, because results are stored
 per target IP and would otherwise collide — scan those in separate runs.
 
+**IPv6 link-local.** A `fe80::/10` line asks for IPv6 link-local discovery on its interface (the
+interface column is required here — the same `fe80::` address exists on every VLAN, so only the
+interface says which link to probe). Pair it with a network on the same interface to scan a link
+over both families in one run:
+```
+192.168.1.0/24   eth0.100
+fe80::/10        eth0.100
+10.113.10.0/24   eth0.200
+fe80::/10        eth0.200
+```
+Discovery uses IPv6 multicast (ICMPv6 echo to `ff02::1`, nmap's `targets-ipv6-multicast-*` scripts,
+and the neighbour cache) instead of an ARP sweep; every scan downstream adds `-6` and the zone id on
+its own when the host is IPv6. Nothing else in the config changes — the family is inferred from the
+address. Devices are matched across IPv4 and IPv6 by **MAC address**, which both the ARP sweep and
+IPv6 neighbour discovery report, and the HTML report gains a comparison section showing where a
+device's two families differ (a port open on one but not the other, a task that reached one but not
+the other).
+
 ### 3.	Initialize mykmyk
 this command creates config.yml. The config contains the configuration for each tool like nmap, ffuf, etc. This command creates a local config (in the current directory) and global under your home directory .config/mykmyk. Mykmyk will try to read the local config at first, if doesn't find then try to read the global one:
 ```
@@ -58,9 +76,11 @@ Available config templates:
 
   1) default  External/routed scan. TCP connect, no host discovery. No root needed.
   2) ARP      Internal L2. ARP-gated discovery, trunk/VLAN aware. Fast, requires root.
+  3) ARP-LL   Dual-stack internal L2. ARP + IPv6 link-local in one run, compared by MAC. Root.
+  4) LL       IPv6 link-local. Multicast discovery per interface, scans over v6. Requires root.
 
-Choose a template [1-2] (default: 1): 2
-Wrote the "ARP" template to ./config.yml
+Choose a template [1-4] (default: 1): 3
+Wrote the "ARP-LL" template to ./config.yml
 ```
 The chosen template is always written as `config.yml`, so `mykmyk scan` needs no extra flags. If a
 `config.yml` already exists you are asked before it is replaced (`--force` skips that).
@@ -93,6 +113,43 @@ mykmyk scan
 ```
 mykmyk status -t hosts
 ```
+Run it from the pentest folder, at any time — during the scan as well as after it. A target that is
+a whole network is expanded into the hosts discovery found inside it, each listed with the tasks
+that have run against it:
+```
+Status for target 192.168.1.215/24
+       arp-discovery                1/1
+       9 hosts up
+
+    Status for target 192.168.1.1
+           ST-scan                  1/1
+           SV-scan                  1/1  (cached)
+           httpx-scan               0/1  FAILED
+           nc-fingerprint           3/5
+           smb-check                0/1
+
+    Status for target 192.168.1.10
+           ST-scan                  1/1
+           not started
+```
+Counts are finished units over total units — a unit is a host for most tasks, but a host:port for
+`nc` and a URL for `ffuf` and `sslscan`, which is why a task can read `3/5` against one host. The
+annotations matter when reading a re-run:
+
+- `(cached)` — the tool **did not run**. A result file from an earlier run in this folder was
+  reused. There is no age check and the arguments are not part of the cache key, so this can be a
+  result from last week, produced by different flags. Set `useCache: false` on the task to force it.
+- `FAILED` — the tool ran and errored, or could not be run. The reason is in `mykmyk.log`.
+- `(skipped)` — deliberately not attempted, e.g. a port-filtered task like `rdp-check` against a
+  host without 3389 open.
+- `not started` — discovery found the host, nothing has reached it yet.
+
+Progress is per run: `mykmyk scan` resets it, so status always describes the current run.
+
+`mykmyk.log`, written in the same folder, carries the detail behind all of this — the task graph,
+each target's start and finish with durations, the exact command line and exit code of every tool
+invoked, which addresses discovery found, and which results came from cache.
+
 ### 6. Finish
 When mykmyk is finished, zip the root folder for a particular pentest and copy it to your local machine. The folder contains the file ***mykmyk-output.html*** which is the report from the scan and files which contains output from the ran tool. In addition, the folder ***report-xml*** contains nmap scans in .xml format:
 ```

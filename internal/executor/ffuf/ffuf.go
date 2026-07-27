@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kosmosec/mykmyk/internal/api"
 	"github.com/kosmosec/mykmyk/internal/credsmanager"
@@ -126,7 +128,14 @@ func (f *Ffuf) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 	outputToFile := make(map[string]string)
 	for r := range resultCh {
 		if r.err != nil {
-			return err
+			// Record and carry on. Returning here ended the whole task on one target's
+			// failure - and returned the outer err, nil at this point, so the task went on
+			// to report success.
+			log.Printf("ffuf: %s scan of %s failed: %s", f.Name, r.target, r.err)
+			if err := status.MarkTargetFailed(db, f.Name, r.target, r.err.Error()); err != nil {
+				log.Printf("ffuf: unable to record failure of %s for %s: %s", f.Name, r.target, err)
+			}
+			continue
 		}
 		liveOutput(f.Name, r.target, r.result)
 		outputToFile[r.target] = r.result
@@ -243,6 +252,15 @@ func (f *Ffuf) scanTarget(target string, msg model.Message, db *sql.DB) (string,
 	fmt.Printf("[+] Ffuf scanning for %s started\n", target)
 	cached, reportPaths, found := f.cache.get(target, f.Name)
 	if f.isCacheActive && found {
+		// One unit per URL, matching how a real run records them, so a cached target reads the
+		// same as a scanned one apart from the annotation.
+		path := cachePath(target, f.Name)
+		log.Printf("ffuf: %s cached for %s, %d %s (%s)", f.Name, target, len(msg.Targets), plural(len(msg.Targets), "url", "urls"), path)
+		for _, targetToStatus := range msg.Targets {
+			if err := status.MarkCached(db, f.Name, target, targetToStatus, path); err != nil {
+				return "", nil, err
+			}
+		}
 		return cached, reportPaths, nil
 	}
 	for _, targetToStatus := range msg.Targets {
@@ -251,11 +269,21 @@ func (f *Ffuf) scanTarget(target string, msg model.Message, db *sql.DB) (string,
 			return "", nil, err
 		}
 	}
+	log.Printf("ffuf: %s started for %s, %d %s", f.Name, target, len(msg.Targets), plural(len(msg.Targets), "url", "urls"))
+	started := time.Now()
 	result, pathsToReport, err := scan(target, msg.Targets, f.args, f.prefix, db, f.Name)
 	if err != nil {
 		return "", nil, err
 	}
+	log.Printf("ffuf: %s done for %s in %s", f.Name, target, time.Since(started).Round(time.Millisecond))
 	return result, pathsToReport, nil
+}
+
+func plural(n int, one string, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func liveOutput(taskName string, target string, result string) {

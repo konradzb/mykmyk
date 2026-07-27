@@ -6,9 +6,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
+	nettarget "github.com/kosmosec/mykmyk/internal/target"
 	"github.com/tomatome/grdp/core"
 	"github.com/tomatome/grdp/glog"
 	"github.com/tomatome/grdp/protocol/nla"
@@ -20,8 +22,8 @@ import (
 	"github.com/tomatome/grdp/protocol/x224"
 )
 
-func RdpConn(ip, domain, user, password string, port int, timeout time.Duration) error {
-	target := fmt.Sprintf("%s:%d", ip, port)
+func RdpConn(ip, domain, user, password string, port int, iface string, timeout time.Duration) error {
+	target := net.JoinHostPort(nettarget.Zoned(ip, iface), strconv.Itoa(port))
 	g := NewClient(target, glog.NONE)
 	err := g.Login(domain, user, password, timeout)
 

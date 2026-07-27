@@ -1,0 +1,196 @@
+# description: Dual-stack internal L2. ARP + IPv6 link-local in one run, compared by MAC. Root.
+#
+# Internal L2 dual-stack profile: scan each device over both IPv4 (ARP-gated) and IPv6 (link-local),
+# in a single run, so the report can put the two side by side and show where they differ - a service
+# firewalled on v4 but reachable on v6 is exactly what this catches.
+#
+# There is ONE pipeline, not two. Every nmap task infers the address family from its target: the
+# discovery task ARP-sweeps a v4 CIDR and multicast-discovers a link-local range, and every scan
+# downstream adds -6 and the zone id on its own when the host is IPv6. Devices are matched across
+# families by MAC address, which both the ARP sweep and IPv6 neighbour discovery report.
+#
+# Requires root. ARP and link-local both stay on the directly attached L2 segment, so pair each
+# network with its link-local range on the SAME interface in ./hosts:
+#   192.168.1.0/24   eth0.100
+#   fe80::/10        eth0.100
+#   10.113.10.0/24   eth0.200
+#   fe80::/10        eth0.200
+outputFile: ./mykmyk-output.html
+workflow:
+  tasks:
+    - name: scope
+      type: filesystem
+      active: true
+      useCache: true
+      run:
+        input: ./hosts
+
+    # One discovery task for both families. A v4 CIDR is ARP-swept (-PR); a fe80::/10 range is
+    # discovered via IPv6 multicast (the executor swaps in the multicast command and ignores -PR).
+    # Either way it emits one message per live address, carrying its interface and MAC.
+    - name: discovery
+      type: nmap
+      source: scope
+      active: true
+      useCache: true
+      concurrency: 8
+      run:
+        args:
+          - "-sn"
+          - "-PR"
+          - "-vvv"
+          - "-oA"
+
+    # Full TCP port scan, live hosts only. --send-ip keeps nmap from re-ARPing hosts the sweep
+    # already proved up (IPv4); -6 and the zone are added automatically for IPv6 targets.
+    - name: ST-scan
+      type: nmap
+      source: discovery
+      active: true
+      useCache: true
+      concurrency: 16
+      run:
+        args:
+          - "-sS"
+          - "-vvv"
+          - "-Pn"
+          - "--send-ip"
+          - "--open"
+          - "--min-rate"
+          - "2000"
+          - "-p-"
+          - "-oA"
+
+    # -sV against only the open ports ST-scan found. No -p here or nmap would rescan all 65535.
+    - name: SV-scan
+      type: nmap
+      source: ST-scan
+      active: true
+      useCache: true
+      concurrency: 8
+      run:
+        args:
+          - "-sV"
+          - "-sC"
+          - "-vvv"
+          - "-Pn"
+          - "--send-ip"
+          - "-A"
+          - "--version-all"
+          - "--open"
+          - "-oA"
+
+    - name: RMI-scan
+      type: nmap
+      source: ST-scan
+      active: true
+      useCache: true
+      concurrency: 8
+      run:
+        args:
+          - "-sT"
+          - "-vvv"
+          - "-Pn"
+          - "--script=+rmi-dumpregistry"
+          - "--open"
+          - "--max-rate"
+          - "1000"
+          - "-oA"
+
+    - name: httpx-scan
+      type: httpx
+      source: ST-scan
+      active: true
+      useCache: true
+      concurrency: 5
+      run:
+        args:
+          - "-td"
+          - "-vhost"
+
+    - name: nuclei-scan
+      type: nuclei
+      source: httpx-scan
+      active: true
+      useCache: true
+      concurrency: 3
+      queueSize: 1024
+      run:
+        args:
+          - "-etags"
+          - "wordpress,dos,fuzz"
+          - "-ud"
+          - "/opt/mykmyk-bundle/nuclei-templates"
+          - "-rl"
+          - "3"
+          - "-c"
+          - "5"
+          - "-ni"
+          - "-duc"
+          - "-nc"
+
+    - name: ffuf-scan
+      type: ffuf
+      source: httpx-scan
+      active: true
+      useCache: true
+      concurrency: 3
+      queueSize: 1024
+      run:
+        args:
+          - "-w"
+          - "/opt/mykmyk-bundle/wordlist/raft-large-directories.txt"
+          - "-ac"
+          - "-rate"
+          - "300"
+          - "-v"
+
+    - name: ssl-scan
+      type: sslscan
+      source: httpx-scan
+      active: true
+      useCache: true
+      concurrency: 5
+      run:
+        args:
+          - "--no-colour"
+          - "--iana-names"
+
+    - name: ssl-scan-psql
+      type: sslscan
+      source: ST-scan
+      port: 5432
+      active: true
+      useCache: true
+      concurrency: 5
+      run:
+        args:
+          - "--no-colour"
+          - "--iana-names"
+          - "--starttls-psql"
+
+    - name: nc-fingerprint
+      type: nc
+      source: ST-scan
+      active: true
+      useCache: true
+      concurrency: 8
+      run:
+        args:
+          - "<>()&;id"
+          - "aa()"
+
+    - name: smb-check
+      type: smb
+      source: ST-scan
+      active: true
+      useCache: true
+      concurrency: 5
+
+    - name: rdp-check
+      type: rdp
+      source: ST-scan
+      port: 3389
+      active: true
+      useCache: true
+      concurrency: 5

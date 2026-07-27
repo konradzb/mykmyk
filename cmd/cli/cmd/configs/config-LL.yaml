@@ -1,0 +1,161 @@
+# description: IPv6 link-local. Multicast discovery per interface, scans over v6. Requires root.
+#
+# Link-local (IPv6) profile: discover hosts on a link via IPv6 multicast, then scan them over their
+# fe80:: address. The mirror of the ARP profile for IPv6 - where ARP sweeps an IPv4 CIDR, this uses
+# ICMPv6 echo to ff02::1 plus nmap's targets-ipv6-multicast-* scripts plus the neighbour cache.
+#
+# Requires root (multicast discovery and a SYN scan both do). Link-local cannot cross a router, so
+# every fe80::/10 line in ./hosts must name the interface that reaches its link.
+#
+# hosts file format - the second column (interface) is REQUIRED for link-local, since the same
+# fe80:: address can exist on every VLAN and only the interface says which link to probe:
+#   fe80::/10   eth0.100
+#   fe80::/10   eth0.200
+#
+# The nmap tasks need no -6 or -e in their args: the executor infers the family from the address and
+# takes the interface from the discovery message. Global/ULA addresses a host also answers on are
+# discovered and scanned alongside its link-local one.
+outputFile: ./mykmyk-output.html
+workflow:
+  tasks:
+    - name: scope
+      type: filesystem
+      active: true
+      useCache: true
+      run:
+        input: ./hosts
+
+    # IPv6 multicast discovery per link -> emits one message per live address (link-local + any
+    # global/ULA the host answers on), carrying its interface. Dead space is never scanned.
+    - name: ll-discovery
+      type: nmap
+      source: scope
+      active: true
+      useCache: true
+      concurrency: 8
+      run:
+        args:
+          - "-sn"
+          - "-vvv"
+          - "-oA"
+
+    # Full TCP port scan over IPv6, live hosts only. -6 and the zone are added by the executor.
+    - name: ST-scan
+      type: nmap
+      source: ll-discovery
+      active: true
+      useCache: true
+      concurrency: 16
+      run:
+        args:
+          - "-sS"
+          - "-vvv"
+          - "-Pn"
+          - "--open"
+          - "--min-rate"
+          - "2000"
+          - "-p-"
+          - "-oA"
+
+    # -sV against only the ports ST-scan found open. No -p here or nmap would rescan all 65535.
+    - name: SV-scan
+      type: nmap
+      source: ST-scan
+      active: true
+      useCache: true
+      concurrency: 8
+      run:
+        args:
+          - "-sV"
+          - "-sC"
+          - "-vvv"
+          - "-Pn"
+          - "-A"
+          - "--version-all"
+          - "--open"
+          - "-oA"
+
+    - name: httpx-scan
+      type: httpx
+      source: ST-scan
+      active: true
+      useCache: true
+      concurrency: 5
+      run:
+        args:
+          - "-td"
+          - "-vhost"
+
+    - name: nuclei-scan
+      type: nuclei
+      source: httpx-scan
+      active: true
+      useCache: true
+      concurrency: 3
+      queueSize: 1024
+      run:
+        args:
+          - "-etags"
+          - "wordpress,dos,fuzz"
+          - "-ud"
+          - "/opt/mykmyk-bundle/nuclei-templates"
+          - "-rl"
+          - "3"
+          - "-c"
+          - "5"
+          - "-ni"
+          - "-duc"
+          - "-nc"
+
+    - name: ffuf-scan
+      type: ffuf
+      source: httpx-scan
+      active: true
+      useCache: true
+      concurrency: 3
+      queueSize: 1024
+      run:
+        args:
+          - "-w"
+          - "/opt/mykmyk-bundle/wordlist/raft-large-directories.txt"
+          - "-ac"
+          - "-rate"
+          - "300"
+          - "-v"
+
+    - name: ssl-scan
+      type: sslscan
+      source: httpx-scan
+      active: true
+      useCache: true
+      concurrency: 5
+      run:
+        args:
+          - "--no-colour"
+          - "--iana-names"
+
+    - name: nc-fingerprint
+      type: nc
+      source: ST-scan
+      active: true
+      useCache: true
+      concurrency: 8
+      run:
+        args:
+          - "<>()&;id"
+          - "aa()"
+
+    - name: smb-check
+      type: smb
+      source: ST-scan
+      active: true
+      useCache: true
+      concurrency: 5
+
+    - name: rdp-check
+      type: rdp
+      source: ST-scan
+      port: 3389
+      active: true
+      useCache: true
+      concurrency: 5

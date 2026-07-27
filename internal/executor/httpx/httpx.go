@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kosmosec/mykmyk/internal/api"
 	"github.com/kosmosec/mykmyk/internal/credsmanager"
@@ -56,7 +58,9 @@ func (h *Httpx) scanTarget(target string, msg model.Message, db *sql.DB) ([]stri
 	fmt.Printf("[+] Httpx scanning for %s started\n", target)
 	cached, found := h.cache.get(target, h.Name)
 	if h.isCacheActive && found {
-		return cached, nil
+		path := cachePath(target, h.Name)
+		log.Printf("httpx: %s cached for %s (%s)", h.Name, target, path)
+		return cached, status.MarkCached(db, h.Name, target, target, path)
 	}
 
 	err := status.AddTaskToStatus(db, h.Name, target, target)
@@ -64,7 +68,9 @@ func (h *Httpx) scanTarget(target string, msg model.Message, db *sql.DB) ([]stri
 		return nil, err
 	}
 
-	output, err := scan(target, msg.Ports, h.args)
+	log.Printf("httpx: %s started for %s", h.Name, target)
+	started := time.Now()
+	output, err := scan(target, msg.Ports, msg.Interface, h.args)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +78,7 @@ func (h *Httpx) scanTarget(target string, msg model.Message, db *sql.DB) ([]stri
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("httpx: %s done for %s in %s", h.Name, target, time.Since(started).Round(time.Millisecond))
 	urls := getURLs(output)
 	return urls, nil
 
@@ -147,7 +154,14 @@ func (h *Httpx) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 
 	for r := range resultCh {
 		if r.err != nil {
-			return err
+			// Record and carry on. Returning here ended the whole task on one target's
+			// failure - and returned the outer err, nil at this point, so the task went on
+			// to report success.
+			log.Printf("httpx: %s scan of %s failed: %s", h.Name, r.target, r.err)
+			if err := status.MarkTargetFailed(db, h.Name, r.target, r.err.Error()); err != nil {
+				log.Printf("httpx: unable to record failure of %s for %s: %s", h.Name, r.target, err)
+			}
+			continue
 		}
 		liveOutput(h.Name, r.target, r.urls)
 		h.sendMessageToSNS(r.target, r.urls)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	nmapWrapper "github.com/Ullaakut/nmap/v3"
+	nettarget "github.com/kosmosec/mykmyk/internal/target"
 )
 
 var ErrEmptyNmapScanResult = errors.New("nmap does not found anything")
@@ -30,7 +31,16 @@ func scan(target string, ports []string, scanOptions []string, scanName string, 
 	ctx, cancel := context.WithTimeout(context.Background(), 1440*time.Minute)
 	defer cancel()
 	nmapArgs := buildScanOptions(scanOptions, label, scanName)
-	result, warnings, err := doScan(ctx, target, label, ports, nmapArgs, scanName, iface)
+	if nettarget.IsIPv6(target) {
+		// An IPv6 target needs -6; the config's own flags (port list, timing, output) are left as
+		// written. Prepended, so the -oA filename buildOutput appended stays the last positional.
+		nmapArgs = append([]string{"-6"}, nmapArgs...)
+	}
+	// Attach the zone for a link-local target (fe80::5 -> fe80::5%eth0), which is what nmap needs to
+	// reach it alongside -e; a no-op for global v6 and IPv4. The output directory stays the bare
+	// address (label, above), so cache keys and report links do not move.
+	scanTarget := nettarget.Zoned(target, iface)
+	result, warnings, err := doScan(ctx, scanTarget, label, ports, nmapArgs, scanName, iface)
 	if err != nil {
 		return nil, nil, err
 	}

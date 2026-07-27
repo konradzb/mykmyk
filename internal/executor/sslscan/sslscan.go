@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kosmosec/mykmyk/internal/api"
 	"github.com/kosmosec/mykmyk/internal/credsmanager"
@@ -108,7 +110,14 @@ func (s *SSLScan) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 	outputToFile := make(map[string]string)
 	for r := range resultCh {
 		if r.err != nil {
-			return err
+			// Record and carry on. Returning here ended the whole task on one target's
+			// failure - and returned the outer err, nil at this point, so the task went on
+			// to report success.
+			log.Printf("sslscan: %s scan of %s failed: %s", s.Name, r.target, r.err)
+			if err := status.MarkTargetFailed(db, s.Name, r.target, r.err.Error()); err != nil {
+				log.Printf("sslscan: unable to record failure of %s for %s: %s", s.Name, r.target, err)
+			}
+			continue
 		}
 		liveOutput(s.Name, r.target, r.result)
 		outputToFile[r.target] = r.result
@@ -226,6 +235,15 @@ func (s *SSLScan) scanTarget(target string, msg model.Message, db *sql.DB) (stri
 	fmt.Printf("[+] SSLscan scanning for %s started\n", target)
 	cached, reportPaths, found := s.cache.get(target, s.Name)
 	if s.isCacheActive && found {
+		// One unit per URL, matching how a real run records them, so a cached target reads the
+		// same as a scanned one apart from the annotation.
+		path := cachePath(target, s.Name)
+		log.Printf("sslscan: %s cached for %s, %d %s (%s)", s.Name, target, len(msg.Targets), plural(len(msg.Targets), "target", "targets"), path)
+		for _, targetToStatus := range msg.Targets {
+			if err := status.MarkCached(db, s.Name, target, targetToStatus, path); err != nil {
+				return "", nil, err
+			}
+		}
 		return cached, reportPaths, nil
 	}
 	for _, targetToStatus := range msg.Targets {
@@ -234,11 +252,21 @@ func (s *SSLScan) scanTarget(target string, msg model.Message, db *sql.DB) (stri
 			return "", nil, err
 		}
 	}
-	result, pathsToReport, err := scan(target, msg.Targets, msg.Ports, s.Port, s.args, db, s.Name)
+	log.Printf("sslscan: %s started for %s, %d %s", s.Name, target, len(msg.Targets), plural(len(msg.Targets), "target", "targets"))
+	started := time.Now()
+	result, pathsToReport, err := scan(target, msg.Targets, msg.Ports, s.Port, msg.Interface, s.args, db, s.Name)
 	if err != nil {
 		return "", nil, err
 	}
+	log.Printf("sslscan: %s done for %s in %s", s.Name, target, time.Since(started).Round(time.Millisecond))
 	return result, pathsToReport, nil
+}
+
+func plural(n int, one string, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func liveOutput(taskName string, target string, result string) {

@@ -11,20 +11,21 @@ import (
 	"time"
 
 	"github.com/kosmosec/mykmyk/internal/status"
+	nettarget "github.com/kosmosec/mykmyk/internal/target"
 )
 
-func scan(host string, ports []string, args []string, taskName string, db *sql.DB) (string, error) {
+func scan(host string, ports []string, args []string, taskName string, iface string, db *sql.DB) (string, error) {
 	if _, err := os.Stat(host); os.IsNotExist(err) {
 		os.Mkdir(host, 0775)
 	}
 	var fingeredServices string
 
 	for _, p := range ports {
-		service, err := fingerprint(host, p, args)
+		service, err := fingerprint(host, p, iface, args)
 		if err != nil {
 			return "", err
 		}
-		err = status.UpdateDoneTaskInStatus(db, taskName, host, fmt.Sprintf("%s:%s", host, p))
+		err = status.UpdateDoneTaskInStatus(db, taskName, host, net.JoinHostPort(host, p))
 		if err != nil {
 			return "", err
 		}
@@ -35,8 +36,8 @@ func scan(host string, ports []string, args []string, taskName string, db *sql.D
 	return fingeredServices, nil
 }
 
-func fingerprint(host string, port string, args []string) (string, error) {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%s", host, port), 5*time.Second)
+func fingerprint(host string, port string, iface string, args []string) (string, error) {
+	conn, err := net.DialTimeout("tcp", nettarget.DialAddr(host, iface, port), 5*time.Second)
 	if err != nil {
 		return "", err
 	}

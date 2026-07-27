@@ -11,14 +11,15 @@ import (
 
 	"github.com/hirochachacha/go-smb2"
 	"github.com/kosmosec/mykmyk/internal/credsmanager"
+	nettarget "github.com/kosmosec/mykmyk/internal/target"
 )
 
-func scan(host string, args []string, creds credsmanager.Credentials) (string, error) {
+func scan(host string, iface string, args []string, creds credsmanager.Credentials) (string, error) {
 	if _, err := os.Stat(host); os.IsNotExist(err) {
 		os.Mkdir(host, 0775)
 	}
 
-	output, err := checkUserSession(host, creds)
+	output, err := checkUserSession(host, iface, creds)
 	if err != nil {
 		return "", nil
 	}
@@ -26,9 +27,9 @@ func scan(host string, args []string, creds credsmanager.Credentials) (string, e
 
 }
 
-func checkUserSession(hostname string, creds credsmanager.Credentials) (string, error) {
+func checkUserSession(hostname string, iface string, creds credsmanager.Credentials) (string, error) {
 	fmt.Printf("[+] SMB scanning for %s started\n", hostname)
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", hostname, 445))
+	conn, err := net.Dial("tcp", nettarget.DialAddr(hostname, iface, "445"))
 	if err != nil {
 		return "", err
 	}

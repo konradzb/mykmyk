@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kosmosec/mykmyk/internal/api"
 	"github.com/kosmosec/mykmyk/internal/credsmanager"
@@ -92,6 +94,12 @@ func (r *Rdp) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 
 					}(ctx, target, msg)
 				} else {
+					// Recorded rather than passed over in silence, so status shows the task was
+					// considered for this host and ruled out, not that it never got there.
+					if err := status.MarkSkipped(db, r.Name, target, target,
+						fmt.Sprintf("port %d not open", r.Port)); err != nil {
+						log.Printf("rdp: unable to record skip of %s for %s: %s", r.Name, target, err)
+					}
 					resultCh <- scanResult{target: target, result: "", err: nil}
 				}
 			}
@@ -100,7 +108,14 @@ func (r *Rdp) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 
 	for rMsg := range resultCh {
 		if rMsg.err != nil {
-			return err
+			// Record and carry on. Returning here ended the whole task on one target's
+			// failure - and returned the outer err, nil at this point, so the task went on
+			// to report success.
+			log.Printf("rdp: %s scan of %s failed: %s", r.Name, rMsg.target, rMsg.err)
+			if err := status.MarkTargetFailed(db, r.Name, rMsg.target, rMsg.err.Error()); err != nil {
+				log.Printf("rdp: unable to record failure of %s for %s: %s", r.Name, rMsg.target, err)
+			}
+			continue
 		}
 		r.saveToFile(rMsg.target, rMsg.result)
 		liveOutput(r.Name, rMsg.target, rMsg.result)
@@ -219,17 +234,24 @@ func isRDPPortExists(desiredPort int, ports []string) bool {
 func (r *Rdp) scanTarget(target string, port int, msg model.Message, db *sql.DB) (string, error) {
 	cached, found := r.cache.get(target, r.Name)
 	if r.isCacheActive && found {
-		return cached, nil
+		// Recorded, not silently returned: without a row here a re-run over a warm cache
+		// leaves status empty, and a plain count would not say whether anything ran.
+		path := cachePath(target, r.Name)
+		log.Printf("rdp: %s cached for %s (%s)", r.Name, target, path)
+		return cached, status.MarkCached(db, r.Name, target, target, path)
 	}
 	err := status.AddTaskToStatus(db, r.Name, target, target)
 	if err != nil {
 		return "", err
 	}
-	output := scan(target, port, r.args, r.credsManager)
+	log.Printf("rdp: %s started for %s", r.Name, target)
+	started := time.Now()
+	output := scan(target, port, msg.Interface, r.args, r.credsManager)
 	err = status.UpdateDoneTaskInStatus(db, r.Name, target, target)
 	if err != nil {
 		return "", err
 	}
+	log.Printf("rdp: %s done for %s in %s", r.Name, target, time.Since(started).Round(time.Millisecond))
 	return output, nil
 }
 

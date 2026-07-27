@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kosmosec/mykmyk/internal/api"
 	"github.com/kosmosec/mykmyk/internal/credsmanager"
@@ -48,12 +50,18 @@ func (n *Nuclei) scanTarget(target string, msg model.Message, db *sql.DB) (strin
 	fmt.Printf("[+] Nuclei scanning for %s started\n", target)
 	cached, found := n.cache.get(target, n.Name)
 	if n.isCacheActive && found {
-		return cached, nil
+		// Recorded, not silently returned: without a row here a re-run over a warm cache
+		// leaves status empty, and a plain count would not say whether anything ran.
+		path := cachePath(target, n.Name)
+		log.Printf("nuclei: %s cached for %s (%s)", n.Name, target, path)
+		return cached, status.MarkCached(db, n.Name, target, target, path)
 	}
 	err := status.AddTaskToStatus(db, n.Name, target, target)
 	if err != nil {
 		return "", err
 	}
+	log.Printf("nuclei: %s started for %s", n.Name, target)
+	started := time.Now()
 	result, err := scan(target, msg.Targets, n.args)
 	if err != nil {
 		return "", err
@@ -62,6 +70,7 @@ func (n *Nuclei) scanTarget(target string, msg model.Message, db *sql.DB) (strin
 	if err != nil {
 		return "", err
 	}
+	log.Printf("nuclei: %s done for %s in %s", n.Name, target, time.Since(started).Round(time.Millisecond))
 	return result, nil
 
 }
@@ -160,7 +169,14 @@ func (n *Nuclei) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 
 	for r := range resultCh {
 		if r.err != nil {
-			return err
+			// Record and carry on. Returning here ended the whole task on one target's
+			// failure - and returned the outer err, nil at this point, so the task went on
+			// to report success.
+			log.Printf("nuclei: %s scan of %s failed: %s", n.Name, r.target, r.err)
+			if err := status.MarkTargetFailed(db, n.Name, r.target, r.err.Error()); err != nil {
+				log.Printf("nuclei: unable to record failure of %s for %s: %s", n.Name, r.target, err)
+			}
+			continue
 		}
 		liveOutput(n.Name, r.target, r.result)
 		n.saveToFile(r.target, r.result)

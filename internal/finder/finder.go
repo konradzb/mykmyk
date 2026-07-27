@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 
 	nmapWrapper "github.com/Ullaakut/nmap/v3"
+
+	"github.com/kosmosec/mykmyk/internal/scope"
 )
 
 func Find(ctx context.Context, targetFile string, portFilter string) error {
-	targets, err := loadScope(targetFile)
+	entries, err := scope.Load(targetFile)
 	if err != nil {
 		return err
 	}
-	for _, t := range targets {
+	for _, e := range entries {
+		t := e.Spec
 		nmapScan, err := loadScan(t, "ST-scan")
 		if err != nil {
 			return err
@@ -44,19 +46,4 @@ func loadScan(target string, key string) (*nmapWrapper.Run, error) {
 		return nil, err
 	}
 	return &scanResult, err
-}
-
-func loadScope(filePath string) ([]string, error) {
-	rawScope, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("read scope from file %v: %w", filePath, err)
-	}
-	targets := strings.Split(string(rawScope), "\n")
-	targetList := make([]string, 0)
-	for _, t := range targets {
-		if t != "" {
-			targetList = append(targetList, strings.TrimSpace(t))
-		}
-	}
-	return targetList, nil
 }

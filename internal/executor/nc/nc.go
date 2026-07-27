@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kosmosec/mykmyk/internal/api"
 	"github.com/kosmosec/mykmyk/internal/credsmanager"
@@ -112,7 +115,14 @@ func (n *Nc) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 
 	for r := range resultCh {
 		if r.err != nil {
-			return err
+			// Record and carry on. Returning here ended the whole task on one target's
+			// failure - and returned the outer err, nil at this point, so the task went on
+			// to report success.
+			log.Printf("nc: %s scan of %s failed: %s", n.Name, r.target, r.err)
+			if err := status.MarkTargetFailed(db, n.Name, r.target, r.err.Error()); err != nil {
+				log.Printf("nc: unable to record failure of %s for %s: %s", n.Name, r.target, err)
+			}
+			continue
 		}
 		// maybe without liveOutput or parametirezd true/false
 		n.saveToFile(r.target, r.result)
@@ -219,19 +229,38 @@ func (n *Nc) scanTarget(target string, msg model.Message, db *sql.DB) (string, e
 	fmt.Printf("[+] Netcat scanning for %s started\n", target)
 	cached, found := n.cache.get(target, n.Name)
 	if n.isCacheActive && found {
+		// One unit per port, matching how a real run records them, so a cached target reads the
+		// same as a scanned one apart from the annotation.
+		path := cachePath(target, n.Name)
+		log.Printf("nc: %s cached for %s, %d %s (%s)", n.Name, target, len(msg.Ports), plural(len(msg.Ports), "port", "ports"), path)
+		for _, portToStatus := range msg.Ports {
+			if err := status.MarkCached(db, n.Name, target, net.JoinHostPort(target, portToStatus), path); err != nil {
+				return "", err
+			}
+		}
 		return cached, nil
 	}
 	for _, portToStatus := range msg.Ports {
-		err := status.AddTaskToStatus(db, n.Name, target, fmt.Sprintf("%s:%s", target, portToStatus))
+		err := status.AddTaskToStatus(db, n.Name, target, net.JoinHostPort(target, portToStatus))
 		if err != nil {
 			return "", err
 		}
 	}
-	output, err := scan(target, msg.Ports, n.args, n.Name, db)
+	log.Printf("nc: %s started for %s, %d %s", n.Name, target, len(msg.Ports), plural(len(msg.Ports), "port", "ports"))
+	started := time.Now()
+	output, err := scan(target, msg.Ports, n.args, n.Name, msg.Interface, db)
 	if err != nil {
 		return "", err
 	}
+	log.Printf("nc: %s done for %s in %s", n.Name, target, time.Since(started).Round(time.Millisecond))
 	return output, nil
+}
+
+func plural(n int, one string, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func (n *Nc) saveToFile(target string, output string) error {

@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"sync"
+	"time"
 
 	nmapWrapper "github.com/Ullaakut/nmap/v3"
 	"github.com/kosmosec/mykmyk/internal/api"
@@ -15,6 +16,7 @@ import (
 	"github.com/kosmosec/mykmyk/internal/model"
 	"github.com/kosmosec/mykmyk/internal/sns"
 	"github.com/kosmosec/mykmyk/internal/status"
+	nettarget "github.com/kosmosec/mykmyk/internal/target"
 	"gopkg.in/yaml.v2"
 )
 
@@ -47,13 +49,19 @@ func (n *Nmap) scanTarget(target string, msg model.Message, db *sql.DB) (*nmapWr
 	fmt.Printf("[+] Nmap scanning for %s started\n", target)
 	cached, found := n.cache.get(target, n.Name)
 	if n.isCacheActive && found {
-		return cached, nil
+		// Recorded, not silently returned: without a row here a re-run over a warm cache leaves
+		// status empty, and a task showing a plain count would not say whether anything ran.
+		path := cachePath(target, n.Name)
+		log.Printf("nmap: %s cached for %s (%s)", n.Name, target, path)
+		return cached, status.MarkCached(db, n.Name, target, target, path)
 	}
 	err := status.AddTaskToStatus(db, n.Name, target, target)
 	if err != nil {
 		return nil, err
 	}
-	result, warnings, err := scan(target, msg.Ports, n.args, n.Name, msg.Interface)
+	log.Printf("nmap: %s started for %s via %s", n.Name, target, describeInterface(msg.Interface))
+	started := time.Now()
+	result, err := n.runScan(target, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -61,8 +69,33 @@ func (n *Nmap) scanTarget(target string, msg model.Message, db *sql.DB) (*nmapWr
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("nmap: %s for %s", warnings, target)
+	log.Printf("nmap: %s done for %s in %s", n.Name, target, time.Since(started).Round(time.Millisecond))
 	return result, nil
+}
+
+// runScan picks the right nmap invocation for the target. A link-local range means IPv6 multicast
+// discovery (there is no address space to sweep); anything else is an ordinary scan, which quietly
+// gains -6 and a zoned target when the address is IPv6. The config never spells the family out - the
+// address is enough to know it.
+func (n *Nmap) runScan(target string, msg model.Message) (*nmapWrapper.Run, error) {
+	if nettarget.IsLinkLocalCIDR(target) {
+		return discoverLinkLocal(msg.Interface, n.Name)
+	}
+	result, warnings, err := scan(target, msg.Ports, n.args, n.Name, msg.Interface)
+	if err != nil {
+		return nil, err
+	}
+	if warnings != nil && len(*warnings) > 0 {
+		log.Printf("nmap: %s warnings for %s: %s", n.Name, target, *warnings)
+	}
+	return result, nil
+}
+
+func describeInterface(iface string) string {
+	if iface == "" {
+		return "kernel routing"
+	}
+	return iface
 }
 
 func (n *Nmap) Run(ctx context.Context, in interface{}, db *sql.DB) error {
@@ -118,6 +151,9 @@ func (n *Nmap) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 			// sweep, where the host has been *proven* to exist - dropping it silently would turn
 			// a broken scan into an apparent clean bill of health.
 			log.Printf("nmap: %s scan of %s failed: %s", n.Name, r.target, r.err)
+			if err := status.MarkFailed(db, n.Name, r.target, r.target, r.err.Error()); err != nil {
+				log.Printf("nmap: unable to record failure of %s for %s: %s", n.Name, r.target, err)
+			}
 			n.collectFailure(r.target, r.err)
 			continue
 		}
@@ -125,7 +161,7 @@ func (n *Nmap) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 			continue
 		}
 		liveOutput(n.Name, r.target, r.result)
-		if err := n.sendMessageToSNS(r.result, r.target, r.iface); err != nil {
+		if err := n.sendMessageToSNS(db, r.result, r.target, r.iface); err != nil {
 			// Nothing usable found for this target - normal for a sweep over a sparse segment.
 			log.Printf("nmap: %s found no live host for %s: %s", n.Name, r.target, err)
 		}
@@ -176,47 +212,154 @@ func (n *Nmap) GetConcurrency() int {
 	return n.Concurrency
 }
 
-func (n *Nmap) sendMessageToSNS(scanResult *nmapWrapper.Run, host string, iface string) error {
-	messages, err := convertToNmapMessage(scanResult, host, iface)
-	if err != nil {
-		return err
+func (n *Nmap) sendMessageToSNS(db *sql.DB, scanResult *nmapWrapper.Run, parent string, iface string) error {
+	if scanResult.Hosts == nil {
+		return ErrEmptyNmapScanResult
 	}
-	for _, msg := range messages {
-		n.sns.SendMessage(n.Name, msg)
+	entries := discoveredEntries(scanResult, parent)
+	if len(entries) == 0 {
+		return ErrEmptyNmapScanResult
 	}
 
+	// This is the only place that knows both halves of the discovery result: the scope entry that
+	// was scanned and the addresses that answered inside it - along with the MAC each answered from.
+	// Nothing downstream can reconstruct the link, because every task after this one is handed a bare
+	// host and never learns which network, or which device, it came from. Recording it here is what
+	// lets status expand a /24 into its live hosts and the report line up a device's v4 and v6 sides.
+	discovered := make([]status.Discovered, 0, len(entries))
+	for _, e := range entries {
+		discovered = append(discovered, status.Discovered{Addr: e.addr, Mac: e.mac, Vendor: e.vendor})
+	}
+	log.Printf("nmap: %s found %d live %s under %s (from %d result entries)",
+		n.Name, len(entries), plural(len(entries), "address", "addresses"), parent, len(scanResult.Hosts))
+	if err := status.RecordHosts(db, parent, n.Name, discovered); err != nil {
+		log.Printf("nmap: unable to record hosts found under %s: %s", parent, err)
+	}
+
+	// Persist open ports so the report can diff a device's IPv4 and IPv6 exposure. A discovery sweep
+	// has none; a port scan records them against the address it scanned.
+	for _, host := range scanResult.Hosts {
+		if !isHostUsable(host) || len(host.Ports) == 0 {
+			continue
+		}
+		for _, addr := range scanAddresses(host, parent) {
+			if err := status.RecordPorts(db, addr, n.Name, toStatusPorts(host.Ports)); err != nil {
+				log.Printf("nmap: unable to record ports for %s: %s", addr, err)
+			}
+		}
+	}
+
+	for _, e := range entries {
+		n.sns.SendMessage(n.Name, model.Message{Targets: []string{e.addr}, Ports: e.ports, Interface: iface})
+	}
 	return nil
 }
 
-// convertToNmapMessage turns one scan result into one message per live host it found.
+func plural(n int, one string, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// convertToNmapMessage turns one scan result into one message per live address it found.
 //
 // A scan of a single IP yields a single message, as it always has. A host-discovery sweep of a
 // whole segment (nmap -sn -PR 10.113.9.0/24) yields one message per host that answered, which is
 // what lets an ARP sweep gate the expensive port scans behind it: only addresses proven to exist
-// are ever handed downstream.
+// are ever handed downstream. An IPv6 host carrying both a link-local and a global address yields
+// one message each, so both get scanned.
 func convertToNmapMessage(result *nmapWrapper.Run, target string, iface string) ([]model.Message, error) {
 	if result.Hosts == nil {
 		return nil, ErrEmptyNmapScanResult
 	}
-	messages := make([]model.Message, 0, len(result.Hosts))
+	entries := discoveredEntries(result, target)
+	if len(entries) == 0 {
+		return nil, ErrEmptyNmapScanResult
+	}
+	messages := make([]model.Message, 0, len(entries))
+	for _, e := range entries {
+		messages = append(messages, model.Message{
+			Targets:   []string{e.addr},
+			Ports:     e.ports,
+			Interface: iface,
+		})
+	}
+	return messages, nil
+}
+
+// discoveredEntry is one scannable address from a result, with the MAC it answered from and the
+// open ports found on its host. One usable host produces one entry per IPv4/IPv6 address it carries.
+type discoveredEntry struct {
+	addr   string
+	mac    string
+	vendor string
+	ports  []string
+}
+
+func discoveredEntries(result *nmapWrapper.Run, target string) []discoveredEntry {
+	entries := make([]discoveredEntry, 0, len(result.Hosts))
 	for _, host := range result.Hosts {
 		if !isHostUsable(host) {
 			continue
 		}
-		ports := make([]string, 0, len(host.Ports))
-		for _, p := range host.Ports {
-			ports = append(ports, strconv.Itoa(int(p.ID)))
+		mac, vendor := hostMacVendor(host)
+		ports := portIDs(host.Ports)
+		for _, addr := range scanAddresses(host, target) {
+			entries = append(entries, discoveredEntry{addr: addr, mac: mac, vendor: vendor, ports: ports})
 		}
-		messages = append(messages, model.Message{
-			Targets:   []string{hostAddress(host, target)},
-			Ports:     ports,
-			Interface: iface,
-		})
 	}
-	if len(messages) == 0 {
-		return nil, ErrEmptyNmapScanResult
+	return entries
+}
+
+// scanAddresses returns the IP addresses of a host worth scanning: its IPv4 address, and every IPv6
+// address it carries (link-local plus any global/ULA the discovery surfaced). It falls back to the
+// scanned target when the result has no address element, so a single-target scan never drops itself.
+func scanAddresses(host nmapWrapper.Host, target string) []string {
+	addrs := make([]string, 0, 1)
+	for _, a := range host.Addresses {
+		if a.AddrType == "ipv4" || a.AddrType == "ipv6" {
+			addrs = append(addrs, a.Addr)
+		}
 	}
-	return messages, nil
+	if len(addrs) == 0 {
+		addrs = append(addrs, target)
+	}
+	return addrs
+}
+
+func hostMacVendor(host nmapWrapper.Host) (string, string) {
+	for _, a := range host.Addresses {
+		if a.AddrType == "mac" {
+			return a.Addr, a.Vendor
+		}
+	}
+	return "", ""
+}
+
+func hostMac(host nmapWrapper.Host) string {
+	mac, _ := hostMacVendor(host)
+	return mac
+}
+
+func portIDs(ports []nmapWrapper.Port) []string {
+	out := make([]string, 0, len(ports))
+	for _, p := range ports {
+		out = append(out, strconv.Itoa(int(p.ID)))
+	}
+	return out
+}
+
+func toStatusPorts(ports []nmapWrapper.Port) []status.Port {
+	out := make([]status.Port, 0, len(ports))
+	for _, p := range ports {
+		proto := p.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		out = append(out, status.Port{Number: int(p.ID), Proto: proto})
+	}
+	return out
 }
 
 // isHostUsable reports whether a host in a scan result is worth scanning further. Under -vvv nmap
