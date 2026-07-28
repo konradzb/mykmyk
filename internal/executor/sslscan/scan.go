@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/kosmosec/mykmyk/internal/binary"
 	"github.com/kosmosec/mykmyk/internal/status"
@@ -23,8 +24,7 @@ func scan(host string, targets []string, ports []string, portToScan int, iface s
 		for _, u := range targets {
 			actualArgs := make([]string, 0)
 			actualArgs = append(actualArgs, args...)
-			parsedUrl, _ := url.Parse(u)
-			sslReportName := fmt.Sprintf("./%s/%s-%s-%s.xml", host, taskName, parsedUrl.Hostname(), parsedUrl.Port())
+			sslReportName := reportPath(host, taskName, u)
 			sslReportArg := fmt.Sprintf("--xml=%s", sslReportName)
 			actualArgs = append(actualArgs, sslReportArg)
 			actualArgs = append(actualArgs, u)
@@ -76,4 +76,25 @@ func scan(host string, targets []string, ports []string, portToScan int, iface s
 	}
 
 	return serviceToCheck, pathsToReport, nil
+}
+
+// reportPath names the per-URL XML report. url.Parse rejects a link-local URL carrying a raw zone
+// (http://[fe80::1%eth0]:80) and returns nil, which used to be dereferenced here for the hostname
+// and port - a panic in an executor goroutine ends the run and loses every other task's results.
+// The fall-back keeps the scan running and still gives it a report to write.
+func reportPath(host string, taskName string, rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil {
+		return fmt.Sprintf("./%s/%s-%s-%s.xml", host, taskName, u.Hostname(), u.Port())
+	}
+	return fmt.Sprintf("./%s/%s-%s.xml", host, taskName, fileSafe(rawURL))
+}
+
+// fileSafe turns a URL into one usable filename component.
+func fileSafe(rawURL string) string {
+	return strings.Map(func(r rune) rune {
+		if strings.ContainsRune("/:%[]?&=", r) {
+			return '-'
+		}
+		return r
+	}, rawURL)
 }

@@ -42,6 +42,7 @@ type Httpx struct {
 
 type scanResult struct {
 	target string
+	iface  string
 	urls   []string
 	err    error
 }
@@ -122,7 +123,7 @@ func (h *Httpx) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 							return
 						default:
 							result, err := h.scanTarget(target, msg, db)
-							resultCh <- scanResult{target: target, urls: result, err: err}
+							resultCh <- scanResult{target: target, iface: msg.Interface, urls: result, err: err}
 							return
 						}
 					}
@@ -164,7 +165,7 @@ func (h *Httpx) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 			continue
 		}
 		liveOutput(h.Name, r.target, r.urls)
-		h.sendMessageToSNS(r.target, r.urls)
+		h.sendMessageToSNS(r.target, r.urls, r.iface)
 		h.saveToFile(r.target, r.urls)
 		h.collectOutput(r.target, r.urls)
 	}
@@ -186,9 +187,14 @@ func (h *Httpx) collectOutput(target string, urls []string) {
 	h.mu.Unlock()
 }
 
-func (h *Httpx) sendMessageToSNS(host string, urls []string) error {
+// sendMessageToSNS forwards the live URLs, carrying the interface they were reached through. Every
+// task behind httpx - nuclei, ffuf, sslscan - is handed a bare URL and has no other way to learn
+// which VLAN it belongs to, and a segment behind a trunk port is only reachable out of the right
+// egress interface. Dropping it here silently routed the rest of the pipeline out of whichever
+// interface the kernel happened to pick.
+func (h *Httpx) sendMessageToSNS(host string, urls []string, iface string) error {
 	if len(urls) != 0 {
-		h.sns.SendMessage(h.Name, model.Message{Targets: urls})
+		h.sns.SendMessage(h.Name, model.Message{Targets: urls, Interface: iface})
 	}
 	return nil
 }
@@ -250,7 +256,18 @@ func getURLs(output string) []string {
 func resolvePortIfEmpty(liveUrls []string) []string {
 	urlList := make([]string, 0)
 	for _, lu := range liveUrls {
-		u, _ := url.Parse(lu)
+		u, err := url.Parse(lu)
+		if err != nil {
+			// A link-local URL carries a raw zone (http://[fe80::1%eth0]:80), which is not a valid
+			// URI - a zone has to be written %25 - so url.Parse returns nil here. That nil used to
+			// be dereferenced on the next line, and a panic in this goroutine takes down the whole
+			// run: every other task's results and the report with it. Pass the URL through as httpx
+			// reported it. It already carries the port this function exists to add, and dropping a
+			// URL httpx proved live would hide a finding.
+			log.Printf("httpx: %q is not a parseable URL, passing it through unchanged: %s", lu, err)
+			urlList = append(urlList, lu)
+			continue
+		}
 		parsedUrlString := u.String()
 		if u.Port() == "" {
 			var port string

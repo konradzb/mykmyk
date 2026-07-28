@@ -51,6 +51,29 @@ func TestIsLinkLocalCIDR(t *testing.T) {
 	}
 }
 
+// Two hosts-file lines can name the same fe80::/10 on different VLANs. If they key the same, one
+// link's results overwrite the other's and a cached run scans every address out of both interfaces.
+func TestScopeKey(t *testing.T) {
+	tests := []struct {
+		spec, iface, want string
+	}{
+		{"fe80::/10", "eth0.100", "fe80::/10%eth0.100"}, // the link, not just the range
+		{"fe80::/10", "eth0.200", "fe80::/10%eth0.200"},
+		{"fe80::/64", "eth0", "fe80::/64%eth0"},
+		{"fe80::/10", "", "fe80::/10"},                 // no interface to key on
+		{"10.113.9.0/24", "eth0.100", "10.113.9.0/24"}, // a routed range is unambiguous
+		{"192.168.1.0/24", "", "192.168.1.0/24"},
+		{"20.77.132.140", "eth0", "20.77.132.140"},
+		{"pentest.co.uk", "", "pentest.co.uk"},
+		{"2001:db8::/32", "eth0", "2001:db8::/32"}, // global v6 is reachable without a link
+	}
+	for _, tt := range tests {
+		if got := ScopeKey(tt.spec, tt.iface); got != tt.want {
+			t.Errorf("ScopeKey(%q, %q) = %q, want %q", tt.spec, tt.iface, got, tt.want)
+		}
+	}
+}
+
 func TestZoned(t *testing.T) {
 	tests := []struct {
 		addr, iface, want string

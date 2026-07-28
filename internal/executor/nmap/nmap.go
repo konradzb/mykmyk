@@ -45,31 +45,34 @@ type scanResult struct {
 	err    error
 }
 
-func (n *Nmap) scanTarget(target string, msg model.Message, db *sql.DB) (*nmapWrapper.Run, error) {
-	fmt.Printf("[+] Nmap scanning for %s started\n", target)
-	cached, found := n.cache.get(target, n.Name)
+// scanTarget scans target and files the result under key. The two differ only for a link-local
+// range, where the same fe80::/10 can appear once per VLAN: target is what nmap is pointed at, key
+// is what the result is stored as. See target.ScopeKey.
+func (n *Nmap) scanTarget(target string, key string, msg model.Message, db *sql.DB) (*nmapWrapper.Run, error) {
+	fmt.Printf("[+] Nmap scanning for %s started\n", key)
+	cached, found := n.cache.get(key, n.Name)
 	if n.isCacheActive && found {
 		// Recorded, not silently returned: without a row here a re-run over a warm cache leaves
 		// status empty, and a task showing a plain count would not say whether anything ran.
-		path := cachePath(target, n.Name)
-		log.Printf("nmap: %s cached for %s (%s)", n.Name, target, path)
-		return cached, status.MarkCached(db, n.Name, target, target, path)
+		path := cachePath(key, n.Name)
+		log.Printf("nmap: %s cached for %s (%s)", n.Name, key, path)
+		return cached, status.MarkCached(db, n.Name, key, key, path)
 	}
-	err := status.AddTaskToStatus(db, n.Name, target, target)
+	err := status.AddTaskToStatus(db, n.Name, key, key)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("nmap: %s started for %s via %s", n.Name, target, describeInterface(msg.Interface))
+	log.Printf("nmap: %s started for %s via %s", n.Name, key, describeInterface(msg.Interface))
 	started := time.Now()
-	result, err := n.runScan(target, msg)
+	result, err := n.runScan(target, key, msg)
 	if err != nil {
 		return nil, err
 	}
-	err = status.UpdateDoneTaskInStatus(db, n.Name, target, target)
+	err = status.UpdateDoneTaskInStatus(db, n.Name, key, key)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("nmap: %s done for %s in %s", n.Name, target, time.Since(started).Round(time.Millisecond))
+	log.Printf("nmap: %s done for %s in %s", n.Name, key, time.Since(started).Round(time.Millisecond))
 	return result, nil
 }
 
@@ -77,9 +80,9 @@ func (n *Nmap) scanTarget(target string, msg model.Message, db *sql.DB) (*nmapWr
 // discovery (there is no address space to sweep); anything else is an ordinary scan, which quietly
 // gains -6 and a zoned target when the address is IPv6. The config never spells the family out - the
 // address is enough to know it.
-func (n *Nmap) runScan(target string, msg model.Message) (*nmapWrapper.Run, error) {
+func (n *Nmap) runScan(target string, key string, msg model.Message) (*nmapWrapper.Run, error) {
 	if nettarget.IsLinkLocalCIDR(target) {
-		return discoverLinkLocal(msg.Interface, n.Name)
+		return discoverLinkLocal(msg.Interface, targetLabel(key), n.Name)
 	}
 	result, warnings, err := scan(target, msg.Ports, n.args, n.Name, msg.Interface)
 	if err != nil {
@@ -123,7 +126,10 @@ func (n *Nmap) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 				wg.Add(1)
 				// nmap gets one IP with multiple ports
 				target := msg.Targets[0]
-				go func(ctx context.Context, target string, msg model.Message) {
+				// What the result is filed under. Identical to target for everything except a
+				// link-local range, which two VLANs can both name - see target.ScopeKey.
+				key := nettarget.ScopeKey(target, msg.Interface)
+				go func(ctx context.Context, target string, key string, msg model.Message) {
 					defer func() {
 						wg.Done()
 						<-limiter
@@ -133,13 +139,13 @@ func (n *Nmap) Run(ctx context.Context, in interface{}, db *sql.DB) error {
 						case <-ctx.Done():
 							return
 						default:
-							result, err := n.scanTarget(target, msg, db)
-							resultCh <- scanResult{target: target, iface: msg.Interface, result: result, err: err}
+							result, err := n.scanTarget(target, key, msg, db)
+							resultCh <- scanResult{target: key, iface: msg.Interface, result: result, err: err}
 							return
 						}
 					}
 
-				}(ctx, target, msg)
+				}(ctx, target, key, msg)
 			}
 		}
 	}()
@@ -262,32 +268,6 @@ func plural(n int, one string, many string) string {
 	return many
 }
 
-// convertToNmapMessage turns one scan result into one message per live address it found.
-//
-// A scan of a single IP yields a single message, as it always has. A host-discovery sweep of a
-// whole segment (nmap -sn -PR 10.113.9.0/24) yields one message per host that answered, which is
-// what lets an ARP sweep gate the expensive port scans behind it: only addresses proven to exist
-// are ever handed downstream. An IPv6 host carrying both a link-local and a global address yields
-// one message each, so both get scanned.
-func convertToNmapMessage(result *nmapWrapper.Run, target string, iface string) ([]model.Message, error) {
-	if result.Hosts == nil {
-		return nil, ErrEmptyNmapScanResult
-	}
-	entries := discoveredEntries(result, target)
-	if len(entries) == 0 {
-		return nil, ErrEmptyNmapScanResult
-	}
-	messages := make([]model.Message, 0, len(entries))
-	for _, e := range entries {
-		messages = append(messages, model.Message{
-			Targets:   []string{e.addr},
-			Ports:     e.ports,
-			Interface: iface,
-		})
-	}
-	return messages, nil
-}
-
 // discoveredEntry is one scannable address from a result, with the MAC it answered from and the
 // open ports found on its host. One usable host produces one entry per IPv4/IPv6 address it carries.
 type discoveredEntry struct {
@@ -297,6 +277,14 @@ type discoveredEntry struct {
 	ports  []string
 }
 
+// discoveredEntries turns one scan result into the addresses worth handing downstream, one entry per
+// live address.
+//
+// A scan of a single IP yields a single entry, as it always has. A host-discovery sweep of a whole
+// segment (nmap -sn -PR 10.113.9.0/24) yields one per host that answered, which is what lets an ARP
+// sweep gate the expensive port scans behind it: only addresses proven to exist are ever handed
+// downstream. An IPv6 host carrying both a link-local and a global address yields one each, so both
+// get scanned.
 func discoveredEntries(result *nmapWrapper.Run, target string) []discoveredEntry {
 	entries := make([]discoveredEntry, 0, len(result.Hosts))
 	for _, host := range result.Hosts {

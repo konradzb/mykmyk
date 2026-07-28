@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/kosmosec/mykmyk/internal/binary"
 	"github.com/kosmosec/mykmyk/internal/status"
@@ -23,8 +24,7 @@ func scan(host string, urls []string, args []string, prefix string, db *sql.DB, 
 		actualArgs = append(actualArgs, args...)
 		actualArgs = append(actualArgs, "-u", urlToFUZZ)
 		actualArgs = append(actualArgs, "-of", "html")
-		parsedUrl, _ := url.Parse(u)
-		ffufReportName := fmt.Sprintf("./%s/ffufReport-%s-%s-%s.html", host, taskName, parsedUrl.Hostname(), parsedUrl.Port())
+		ffufReportName := reportPath(host, taskName, u)
 		actualArgs = append(actualArgs, "-o", ffufReportName)
 		output, _, err := binary.Run("ffuf", actualArgs, nil)
 		if err != nil {
@@ -39,6 +39,27 @@ func scan(host string, urls []string, args []string, prefix string, db *sql.DB, 
 	}
 
 	return fuzzedURLs, pathsToReport, nil
+}
+
+// reportPath names the per-URL HTML report. url.Parse rejects a link-local URL carrying a raw zone
+// (http://[fe80::1%eth0]:80) and returns nil, which used to be dereferenced here for the hostname
+// and port - a panic in an executor goroutine ends the run and loses every other task's results.
+// The fall-back keeps the scan running and still gives it a report to write.
+func reportPath(host string, taskName string, rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil {
+		return fmt.Sprintf("./%s/ffufReport-%s-%s-%s.html", host, taskName, u.Hostname(), u.Port())
+	}
+	return fmt.Sprintf("./%s/ffufReport-%s-%s.html", host, taskName, fileSafe(rawURL))
+}
+
+// fileSafe turns a URL into one usable filename component.
+func fileSafe(rawURL string) string {
+	return strings.Map(func(r rune) rune {
+		if strings.ContainsRune("/:%[]?&=", r) {
+			return '-'
+		}
+		return r
+	}, rawURL)
 }
 
 func prepareURL(url string, prefix string) string {

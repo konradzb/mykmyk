@@ -37,6 +37,24 @@ func IsLinkLocalCIDR(spec string) bool {
 	return ip.To4() == nil && ip.IsLinkLocalUnicast()
 }
 
+// ScopeKey identifies one hosts-file entry, which for a link-local range has to include the
+// interface: fe80::/10 on eth0.100 and fe80::/10 on eth0.200 are two different links that happen to
+// share a CIDR, and scope.Load admits both for exactly that reason.
+//
+// Results are filed under this key - the output directory, the cache path, and the parent a
+// discovered host is recorded against. Without the interface in it the two links overwrite each
+// other's output, their hosts pile up under one parent so status attributes them to the wrong VLAN,
+// and a re-run over a warm cache serves one link's host list to both - scanning every address out
+// of an interface it was never seen on.
+//
+// Every other kind of entry is returned unchanged, so no IPv4 path moves.
+func ScopeKey(spec, iface string) string {
+	if iface == "" || !IsLinkLocalCIDR(spec) {
+		return spec
+	}
+	return spec + "%" + iface
+}
+
 // Zoned attaches the egress interface to a link-local address as its zone id (fe80::1 -> fe80::1%eth0),
 // which is what nmap's -e and Go's net dialer both need to reach it. A global v6 or v4 address needs
 // no zone and is returned unchanged, as is an address that already carries one, so this is a no-op

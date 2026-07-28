@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 
@@ -20,24 +20,26 @@ import (
 const multicastScripts = "targets-ipv6-multicast-echo,targets-ipv6-multicast-invalid-dst," +
 	"targets-ipv6-multicast-slaac,targets-ipv6-multicast-mld"
 
-// neighLine pulls the address and, when present, the hardware address out of one `ip -6 neigh`
-// row: "fe80::1 dev eth0 lladdr 52:54:00:aa:bb:cc REACHABLE". The lladdr group is optional because
-// an entry can be listed without one; those are only useful if the address is otherwise unknown.
-var neighLine = regexp.MustCompile(`^([0-9a-fA-F:]+)\s+.*?(?:lladdr\s+([0-9a-fA-F:]+))?\s+(\w+)$`)
-
 // discoverLinkLocal finds the IPv6 hosts on one link, reproducing the three-source union of
 // nmap_pipeline_ll.py: an ICMPv6 echo to the all-nodes group to prime the neighbour cache, nmap's
 // multicast discovery scripts (the structured backbone), and the kernel neighbour cache to catch
 // anything the scripts missed. It returns a *Run so the result flows through the same
-// convertToNmapMessage / RecordHosts machinery an IPv4 sweep uses - nothing downstream knows or
-// cares that discovery went over IPv6.
-func discoverLinkLocal(iface string, name string) (*nmapWrapper.Run, error) {
+// discoveredEntries / RecordHosts machinery an IPv4 sweep uses - nothing downstream knows or cares
+// that discovery went over IPv6.
+//
+// label is where the result is filed, and it carries the interface, because two hosts-file lines
+// can name the same fe80::/10 on two different VLANs - see linkLabel.
+//
+// A link where nothing answered comes back as an empty *Run, not an error. An empty segment is a
+// finding, not a failure, and reporting it as one would put a "not scanned reliably" block in the
+// report for a link that was scanned perfectly well. The caller classifies it exactly as it already
+// classifies an ARP sweep that swept a segment with nothing on it.
+func discoverLinkLocal(iface string, label string, name string) (*nmapWrapper.Run, error) {
 	if iface == "" {
 		// Link-local is meaningless without an interface: the same fe80:: address can exist on
 		// every VLAN, and only the egress interface says which link to probe.
 		return nil, fmt.Errorf("link-local discovery needs an interface - add one to the hosts-file line, e.g. \"fe80::/10 eth0.100\"")
 	}
-	label := targetLabel("fe80::/10")
 	if _, err := os.Stat(label); os.IsNotExist(err) {
 		os.Mkdir(label, 0775)
 	}
@@ -49,10 +51,6 @@ func discoverLinkLocal(iface string, name string) (*nmapWrapper.Run, error) {
 		return nil, err
 	}
 	mergeNeighbours(run, iface)
-
-	if len(usableHosts(run)) == 0 {
-		return nil, ErrEmptyNmapScanResult
-	}
 	return run, nil
 }
 
@@ -137,20 +135,24 @@ func mergeNeighbours(run *nmapWrapper.Run, iface string) {
 	}
 }
 
+// parseNeighbour pulls the address, hardware address and state out of one neighbour-cache row:
+//
+//	fe80::1 lladdr 52:54:00:aa:bb:cc router REACHABLE
+//
+// Fields rather than one pattern, because what sits between the lladdr and the state is open-ended
+// - router, proxy, extern_learn, offload - and every flag a pattern fails to anticipate costs the
+// MAC of that row. The MAC is the only thing tying this host to its IPv4 self, so losing one is
+// losing the device from the comparison entirely.
 func parseNeighbour(line string) (addr, mac, state string) {
-	m := neighLine.FindStringSubmatch(strings.TrimSpace(line))
-	if m == nil {
+	fields := strings.Fields(line)
+	if len(fields) < 2 || net.ParseIP(fields[0]) == nil {
 		return "", "", ""
 	}
-	return m[1], m[2], m[3]
-}
-
-func usableHosts(run *nmapWrapper.Run) []nmapWrapper.Host {
-	hosts := make([]nmapWrapper.Host, 0, len(run.Hosts))
-	for _, h := range run.Hosts {
-		if isHostUsable(h) {
-			hosts = append(hosts, h)
+	for i, f := range fields {
+		if f == "lladdr" && i+1 < len(fields) {
+			mac = fields[i+1]
+			break
 		}
 	}
-	return hosts
+	return fields[0], mac, fields[len(fields)-1]
 }

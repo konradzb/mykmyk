@@ -189,6 +189,46 @@ func TestStatusReadsTheInterfaceColumn(t *testing.T) {
 	}
 }
 
+// The dual-stack profile documents two fe80::/10 lines, one per VLAN, and scope.Load admits them
+// because link-local space is scoped to an interface. Each link's hosts have to stay under their own
+// entry - merging them attributes a host to a VLAN it was never seen on.
+func TestStatusKeepsLinkLocalLinksApart(t *testing.T) {
+	inScanDirectory(t)
+	db := newDB(t)
+
+	done(t, db, "ll-discovery", "fe80::/10%eth0.100", "fe80::/10%eth0.100")
+	done(t, db, "ll-discovery", "fe80::/10%eth0.200", "fe80::/10%eth0.200")
+	if err := RecordHosts(db, "fe80::/10%eth0.100", "ll-discovery", discovered("fe80::100")); err != nil {
+		t.Fatalf("record eth0.100 host: %s", err)
+	}
+	if err := RecordHosts(db, "fe80::/10%eth0.200", "ll-discovery", discovered("fe80::200")); err != nil {
+		t.Fatalf("record eth0.200 host: %s", err)
+	}
+
+	hosts := writeHosts(t, "fe80::/10   eth0.100\nfe80::/10   eth0.200\n")
+	out := capture(t, func() error {
+		return Status(context.Background(), hosts, config("ll-discovery"))
+	})
+
+	// Each link heads its own section, with only the host discovery found on it.
+	for _, want := range []string{
+		"Status for target fe80::/10%eth0.100",
+		"Status for target fe80::/10%eth0.200",
+		"fe80::100",
+		"fe80::200",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "2 hosts up") {
+		t.Errorf("the two links' hosts were merged into one entry:\n%s", out)
+	}
+	if strings.Contains(out, "Other targets") {
+		t.Errorf("both entries should be attributed to a scope line:\n%s", out)
+	}
+}
+
 func TestStatusAnnotatesCachedFailedAndSkipped(t *testing.T) {
 	inScanDirectory(t)
 	db := newDB(t)
@@ -442,6 +482,45 @@ func TestDevicesComparesFamiliesByMac(t *testing.T) {
 	}}
 	if diff := cmp.Diff(want, devices); diff != "" {
 		t.Errorf("device comparison mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// nmap writes MACs uppercase in its XML, the kernel neighbour cache writes them lowercase, and a
+// dual-stack device routinely gets one from each. Grouping on the raw string would split it in two.
+func TestDevicesMatchesMacRegardlessOfCase(t *testing.T) {
+	inScanDirectory(t)
+	db := newDB(t)
+
+	// v4 as nmap's ARP sweep reports it, v6 as `ip -6 neigh` reports it.
+	if err := RecordHosts(db, "192.168.1.0/24", "discovery",
+		[]Discovered{{Addr: "192.168.1.5", Mac: "AA:BB:CC:DD:EE:FF", Vendor: "Acme"}}); err != nil {
+		t.Fatalf("record v4 host: %s", err)
+	}
+	if err := RecordHosts(db, "fe80::/10%eth0.100", "ll-discovery",
+		[]Discovered{{Addr: "fe80::5", Mac: "aa:bb:cc:dd:ee:ff"}}); err != nil {
+		t.Fatalf("record v6 host: %s", err)
+	}
+
+	devices, err := Devices(db)
+	if err != nil {
+		t.Fatalf("Devices: %s", err)
+	}
+	if len(devices) != 1 {
+		t.Fatalf("want the two families on one device, got %d rows: %+v", len(devices), devices)
+	}
+	want := Device{
+		Mac:         "aa:bb:cc:dd:ee:ff",
+		Vendor:      "Acme",
+		V4Addrs:     []string{"192.168.1.5"},
+		V6Addrs:     []string{"fe80::5"},
+		PortsBoth:   []string{},
+		PortsV4Only: []string{},
+		PortsV6Only: []string{},
+		TasksV4Only: []string{},
+		TasksV6Only: []string{},
+	}
+	if diff := cmp.Diff(want, devices[0]); diff != "" {
+		t.Errorf("device mismatch (-want +got):\n%s", diff)
 	}
 }
 

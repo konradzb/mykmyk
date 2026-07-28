@@ -204,6 +204,24 @@ type reportData struct {
 	Devices []status.Device
 }
 
+// anchor turns a target into a fragment id that survives both of the template's escapers. The same
+// value rendered into id="..." goes through the HTML escaper and into href="#..." through the URL
+// escaper, and the two disagree about ':' - an IPv6 target became id="fe80::5" against
+// href="#fe80%3a%3a5", so every link in the table of contents missed its section. Restricting the id
+// to characters neither escaper touches is what makes the two ends match.
+func anchor(target string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		case r == '-', r == '.', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, target)
+}
+
 func prettyOutput(reportName string, tasks []abstract.Executor, db *sql.DB) {
 	data := reportData{
 		IPv4: make(map[string][]model.Output),
@@ -230,7 +248,10 @@ func prettyOutput(reportName string, tasks []abstract.Executor, db *sql.DB) {
 	}
 	defer f.Close()
 
-	tmpl, err := template.New("").Funcs(template.FuncMap{"join": strings.Join}).Parse(htmlReport)
+	tmpl, err := template.New("").Funcs(template.FuncMap{
+		"join":   strings.Join,
+		"anchor": anchor,
+	}).Parse(htmlReport)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -451,10 +472,10 @@ TD { font-size: 0.8em; }
 	  <ul>
 		{{ if .Devices }}<li><a href="#device-comparison" tabindex="1">Device comparison</a></li>{{ end }}
 		{{ range $target, $outputs := .IPv4}}
-	    <li><a href="#{{ $target }}" tabindex="1">{{ $target }}</a></li>
+	    <li><a href="#{{ anchor $target }}" tabindex="1">{{ $target }}</a></li>
 		{{ end }}
 		{{ range $target, $outputs := .IPv6}}
-	    <li><a href="#{{ $target }}" tabindex="1">{{ $target }}</a></li>
+	    <li><a href="#{{ anchor $target }}" tabindex="1">{{ $target }}</a></li>
 		{{ end }}
 	  </ul>
 	</div>
@@ -500,7 +521,7 @@ TD { font-size: 0.8em; }
 
 {{ define "targetOutputs" }}
 	{{range $target, $outputs := .}}
-		<span class="BODH0" id="{{ $target }}">{{ $target }}</span>
+		<span class="BODH0" id="{{ anchor $target }}">{{ $target }}</span>
 		{{ range $output := $outputs}}
 			<span class="TEXT">
 

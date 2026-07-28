@@ -183,12 +183,18 @@ type Discovered struct {
 // RecordHosts stores the addresses a task found live under the target it scanned. For a discovery
 // sweep that is one row per host in the segment; for a single-host scan parent and host are the
 // same address, which the reader ignores.
+//
+// The MAC is lower-cased on the way in, because the two sources disagree about case: nmap writes it
+// uppercase in its XML, the kernel neighbour cache lowercase. Devices() groups on the string, so
+// without this a device whose IPv6 MAC came from the neighbour cache and whose IPv4 MAC came from
+// the ARP sweep would be two rows that never compare - which is exactly the host the neighbour-cache
+// merge exists to rescue.
 func RecordHosts(db *sql.DB, parent string, taskName string, hosts []Discovered) error {
 	for _, h := range hosts {
 		_, err := db.Exec(
 			"INSERT OR IGNORE INTO Hosts (Parent, Host, TaskName, Mac, Vendor, FoundAt) "+
 				"VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-			parent, h.Addr, taskName, h.Mac, h.Vendor)
+			parent, h.Addr, taskName, strings.ToLower(h.Mac), h.Vendor)
 		if err != nil {
 			return err
 		}
@@ -482,10 +488,13 @@ func Status(ctx context.Context, targetFile string, cfg api.Config) error {
 	printed := make(map[string]bool)
 
 	for _, e := range entries {
-		printTarget(e.Spec, 0, units[e.Spec], order)
-		printed[e.Spec] = true
+		// Results are filed under the scope key, not the bare spec: two hosts-file lines can name
+		// the same fe80::/10 on different VLANs, and each has its own results.
+		key := target.ScopeKey(e.Spec, e.Interface)
+		printTarget(key, 0, units[key], order)
+		printed[key] = true
 
-		hosts := discovered[e.Spec]
+		hosts := discovered[key]
 		if len(hosts) == 0 {
 			fmt.Println()
 			continue
@@ -502,9 +511,9 @@ func Status(ctx context.Context, targetFile string, cfg api.Config) error {
 	// Anything the scope file cannot account for still gets shown. A target that reached the
 	// database but belongs to no listed network is a discrepancy worth seeing, not one to hide.
 	orphans := make([]string, 0)
-	for target := range units {
-		if !printed[target] {
-			orphans = append(orphans, target)
+	for t := range units {
+		if !printed[t] {
+			orphans = append(orphans, t)
 		}
 	}
 	if len(orphans) > 0 {
