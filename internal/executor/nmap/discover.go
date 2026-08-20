@@ -48,7 +48,15 @@ func discoverLinkLocal(iface string, label string, name string) (*nmapWrapper.Ru
 
 	run, err := runMulticastDiscovery(iface, label, name)
 	if err != nil {
-		return nil, err
+		// Non-fatal, exactly as nmap_pipeline_ll.py phase 0 treats it ("relying on the other
+		// sources"). The multicast scripts are one of three discovery sources; the ICMPv6 echo
+		// above has already primed the neighbour cache that mergeNeighbours reads next. Aborting the
+		// whole segment because this single source errored - e.g. nmap failing to bind an IPv6
+		// socket to the link-local source (mksock_bind_addr ... Invalid argument, seen on an
+		// interface whose only IPv6 address is link-local) - is what turned a link full of hosts
+		// into a FAILED segment. An empty run here lets mergeNeighbours recover them from the cache.
+		log.Printf("nmap: link-local multicast discovery on %s exited abnormally, relying on ping + neighbour cache: %s", iface, err)
+		run = &nmapWrapper.Run{}
 	}
 	mergeNeighbours(run, iface)
 	return run, nil

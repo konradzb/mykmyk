@@ -22,18 +22,33 @@ func scan(host string, targets []string, ports []string, portToScan int, iface s
 	pathsToReport := make([]string, 0)
 	if len(ports) == 0 {
 		for _, u := range targets {
+			// sslscan is a TLS scanner and httpx already told cleartext from TLS apart. A cleartext
+			// http:// URL has no TLS to scan and sslscan rejects the scheme outright ("Invalid
+			// target specified"), so skip it: record the unit skipped (not failed), never pending.
+			sslscanTarget, ok := sslTarget(u, iface)
+			if !ok {
+				if err := status.MarkSkipped(db, taskName, host, u, "not a TLS endpoint"); err != nil {
+					return "", nil, err
+				}
+				continue
+			}
 			actualArgs := make([]string, 0)
 			actualArgs = append(actualArgs, args...)
 			sslReportName := reportPath(host, taskName, u)
 			sslReportArg := fmt.Sprintf("--xml=%s", sslReportName)
 			actualArgs = append(actualArgs, sslReportArg)
-			actualArgs = append(actualArgs, u)
+			actualArgs = append(actualArgs, sslscanTarget)
 			output, _, err := binary.Run("sslscan", actualArgs, nil)
 			if err != nil {
-				return "", nil, err
+				// One URL failing must not abort the host's other URLs: a broken http:// probe used
+				// to return here and skip a live https:// one behind it. Record this unit failed and
+				// carry on; a bare return is reserved for the DB errors below.
+				if markErr := status.MarkFailed(db, taskName, host, u, err.Error()); markErr != nil {
+					return "", nil, markErr
+				}
+				continue
 			}
-			err = status.UpdateDoneTaskInStatus(db, taskName, host, u)
-			if err != nil {
+			if err := status.UpdateDoneTaskInStatus(db, taskName, host, u); err != nil {
 				return "", nil, err
 			}
 			pathsToReport = append(pathsToReport, sslReportName)
@@ -97,4 +112,50 @@ func fileSafe(rawURL string) string {
 		}
 		return r
 	}, rawURL)
+}
+
+// sslTarget turns an httpx URL into a target sslscan accepts, or reports that it should be skipped.
+// sslscan is a TLS scanner: handed a scheme-qualified URL it answers "Invalid target specified", and
+// a cleartext http:// endpoint has no TLS to scan, so only https:// URLs yield a target. The scheme
+// is stripped to a bare host:port, zone-attached and bracketed for a link-local IPv6 host by
+// DialAddr (fe80::1%eth0 -> [fe80::1%eth0]:8443). It is parsed by hand rather than with url.Parse,
+// which rejects the raw '%' zone httpx passes through (https://[fe80::1%eth0]:8443).
+func sslTarget(rawURL, iface string) (string, bool) {
+	const httpsPrefix = "https://"
+	if !strings.HasPrefix(rawURL, httpsPrefix) {
+		return "", false
+	}
+	authority := strings.TrimPrefix(rawURL, httpsPrefix)
+	// Drop any path/query/fragment after the authority.
+	if i := strings.IndexAny(authority, "/?#"); i >= 0 {
+		authority = authority[:i]
+	}
+	host, port := splitAuthority(authority)
+	if host == "" {
+		return "", false
+	}
+	if port == "" {
+		port = "443"
+	}
+	return nettarget.DialAddr(host, iface, port), true
+}
+
+// splitAuthority separates a URL authority into host and port, tolerating a bracketed IPv6 literal
+// carrying a raw zone ([fe80::1%eth0]:8443 -> "fe80::1%eth0", "8443") that net.SplitHostPort rejects.
+func splitAuthority(authority string) (host, port string) {
+	if strings.HasPrefix(authority, "[") {
+		end := strings.IndexByte(authority, ']')
+		if end < 0 {
+			return "", ""
+		}
+		host = authority[1:end]
+		if rest := authority[end+1:]; strings.HasPrefix(rest, ":") {
+			port = rest[1:]
+		}
+		return host, port
+	}
+	if i := strings.LastIndexByte(authority, ':'); i >= 0 {
+		return authority[:i], authority[i+1:]
+	}
+	return authority, ""
 }
