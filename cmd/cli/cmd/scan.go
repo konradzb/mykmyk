@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/kosmosec/mykmyk/internal/api"
+	"github.com/kosmosec/mykmyk/internal/preflight"
 	"github.com/kosmosec/mykmyk/internal/scanner"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -12,6 +13,7 @@ import (
 )
 
 func NewScan() *cobra.Command {
+	var skipCheck bool
 
 	newScan := cobra.Command{
 		Use:   "scan",
@@ -26,6 +28,19 @@ func NewScan() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Preflight before touching the network: a missing tool or wordlist would otherwise fail
+			// on every host and waste the whole run. --skip-check restores the old start-anyway path.
+			if !skipCheck {
+				result := preflight.New().Check(cfg)
+				if len(result.Findings) > 0 {
+					printReport(os.Stdout, cfg, result)
+				}
+				if !result.OK() {
+					cmd.SilenceUsage = true
+					cmd.SilenceErrors = true
+					return fmt.Errorf("preflight found problems; fix them or re-run with --skip-check")
+				}
+			}
 			err = scanner.Scan(cmd.Context(), cfg)
 			if err != nil {
 				return err
@@ -33,6 +48,8 @@ func NewScan() *cobra.Command {
 			return nil
 		},
 	}
+
+	newScan.Flags().BoolVar(&skipCheck, "skip-check", false, "Skip the pre-scan dependency check")
 
 	return &newScan
 }

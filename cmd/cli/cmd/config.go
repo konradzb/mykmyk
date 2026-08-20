@@ -24,6 +24,17 @@ import (
 //go:embed configs
 var configProfiles embed.FS
 
+// defaultWordlist is the compact directory list init lays down so a fresh config's ffuf task has a
+// wordlist without the operator sourcing one. The shipped templates reference it through dataSentinel.
+//
+//go:embed bundle/wordlists/directories.txt
+var defaultWordlist []byte
+
+// dataSentinel is the placeholder the templates carry in place of an absolute data path, which is
+// unknowable until init runs (it depends on $HOME). init replaces it with the real mykmyk data dir
+// so tools like ffuf receive a path they can open.
+const dataSentinel = "__MYKMYK_DATA__"
+
 const (
 	configProfileDir = "configs"
 	defaultProfile   = "default"
@@ -82,6 +93,10 @@ func NewConfig() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := ensureDefaultWordlist(); err != nil {
+				return err
+			}
+			cfg = []byte(strings.ReplaceAll(string(cfg), dataSentinel, mykmykDataDir()))
 			if err := creatLocalConfig(cfg); err != nil {
 				return err
 			}
@@ -271,6 +286,29 @@ func creatLocalConfig(cfg []byte) error {
 		return err
 	}
 
+	return nil
+}
+
+// mykmykDataDir is where init lays down bundled data (currently the default wordlist) and what
+// dataSentinel resolves to. It mirrors createGlobalConfig's own use of $HOME/.config/mykmyk.
+func mykmykDataDir() string {
+	return fmt.Sprintf("%s/.config/mykmyk", os.Getenv("HOME"))
+}
+
+// ensureDefaultWordlist writes the embedded wordlist under the data dir so a fresh config's ffuf task
+// can run. An existing wordlist is left untouched - like the global config, which is only written
+// when absent - so a re-init does not clobber a list the operator has swapped in or edited.
+func ensureDefaultWordlist() error {
+	wordlistDir := fmt.Sprintf("%s/wordlists", mykmykDataDir())
+	if err := os.MkdirAll(wordlistDir, os.ModePerm); err != nil {
+		return err
+	}
+	wordlistPath := fmt.Sprintf("%s/directories.txt", wordlistDir)
+	if _, err := os.Stat(wordlistPath); errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(wordlistPath, defaultWordlist, 0664); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

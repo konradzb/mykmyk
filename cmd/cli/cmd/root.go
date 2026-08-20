@@ -33,6 +33,7 @@ func NewRoot() *cobra.Command {
 		NewConfig(),
 		NewFind(),
 		NewStatus(),
+		NewCheck(),
 	)
 
 	return rootCmd

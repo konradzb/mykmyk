@@ -119,8 +119,6 @@ workflow:
         args:
           - "-etags"
           - "wordpress,dos,fuzz"
-          - "-ud"
-          - "/opt/mykmyk-bundle/nuclei-templates"
           - "-rl"
           - "3"
           - "-c"
@@ -139,7 +137,7 @@ workflow:
       run:
         args:
           - "-w"
-          - "/opt/mykmyk-bundle/wordlist/raft-large-directories.txt"
+          - "__MYKMYK_DATA__/wordlists/directories.txt"
           - "-ac"
           - "-rate"
           - "300"
